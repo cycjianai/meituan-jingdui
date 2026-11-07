@@ -2,14 +2,54 @@
 """
 Export Meituan H5 Shangou Full-Dimension Competitor Data to a Single-Sheet Excel.
 Part of the `meituanjingdui` skill.
+
+HARD-LOCKED SPECIFICATION (DO NOT MODIFY):
+1. Worksheet count & name: Strictly 1 worksheet named `全量商品竞对明细`.
+2. Column headers: Strictly locked to the exact 27 columns in `LOCKED_27_HEADERS`.
+3. `规格类型` values: Strictly locked to ONLY `'单规格'` or `'多规格'`.
+4. Output filename format: `{MMDD}{店铺名称}.xlsx` (e.g., `1108满家喜超市长清店.xlsx`, parentheses stripped).
 """
 import os
 import re
 import json
 import argparse
+from datetime import datetime
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
+
+# Strictly locked 27 columns — NEVER alter order, names, or count
+LOCKED_27_HEADERS = (
+    'SPU_ID',
+    'SKU_ID',
+    'UPC条形码(69码)',
+    '商品名称',
+    '规格类型',
+    '子规格名称(spec)',
+    '店内一级分类',
+    '店内二级分类',
+    '店内分类排名',
+    '美团一级类目',
+    '美团二级类目',
+    '美团三级类目名称',
+    '月销量(数值)',
+    '想买人数',
+    '点赞数',
+    '实时库存',
+    '原价(元)',
+    '直接折扣价(元)',
+    '神价/到手价(元)',
+    '到手价说明',
+    '竞对有效基准价(元)',
+    '促销标签',
+    '满减商品券',
+    '限购份数',
+    '最小起购数',
+    '售卖属性(温度/提示)',
+    '高清无水印主图URL',
+)
+
+LOCKED_SPEC_TYPES = ('单规格', '多规格')
 
 # Built-in fallback mapping of known 满佳喜超市 L2 sub_tag IDs -> L2 category names
 KNOWN_SUB_TAG_NAMES = {
@@ -78,6 +118,16 @@ KNOWN_SUB_TAG_NAMES = {
     '1790727277': '火鸡农心',
     '1791236112': '白象系列.',
 }
+
+
+def format_locked_excel_path(out_dir, store_name, date_mmdd=None):
+    """
+    Strictly format output filename as: `{MMDD}{店铺名称}.xlsx`
+    e.g. `1108满家喜超市长清店.xlsx` (strip parentheses and whitespace).
+    """
+    mmdd = date_mmdd or datetime.now().strftime('%m%d')
+    clean_store = re.sub(r'[（）()\s/\\:*?"<>|]+', '', str(store_name or '竞对门店').strip())
+    return os.path.join(out_dir, f"{mmdd}{clean_store}.xlsx")
 
 
 def parse_monthly_sales(saled_content, saled_num=0):
@@ -216,19 +266,11 @@ def build_excel(spus_jsonl, cat_json, out_xlsx):
     header_font = Font(color='FFFFFF', bold=True)
     multi_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
 
-    # Single Worksheet ONLY: 全量商品竞对明细表 (包含所有规格逐行展开，共27列)
+    # Single Worksheet ONLY: 全量商品竞对明细 (包含所有规格逐行展开，严格锁定27列)
     ws = wb.active
     ws.title = '全量商品竞对明细'
-    headers = [
-        'SPU_ID', 'SKU_ID', 'UPC条形码(69码)', '商品名称',
-        '规格类型', '子规格名称(spec)',
-        '店内一级分类', '店内二级分类', '店内分类排名',
-        '美团一级类目', '美团二级类目', '美团三级类目名称',
-        '月销量(数值)', '想买人数', '点赞数', '实时库存',
-        '原价(元)', '直接折扣价(元)', '神价/到手价(元)', '到手价说明', '竞对有效基准价(元)',
-        '促销标签', '满减商品券', '限购份数', '最小起购数',
-        '售卖属性(温度/提示)', '高清无水印主图URL'
-    ]
+    headers = list(LOCKED_27_HEADERS)
+    assert len(headers) == 27, f"Header count must be 27, got {len(headers)}"
     ws.append(headers)
     for cell in ws[1]:
         cell.fill = header_fill
@@ -244,6 +286,7 @@ def build_excel(spus_jsonl, cat_json, out_xlsx):
         # Strictly two options for 规格类型: '单规格' or '多规格'
         is_multi = len(skus) > 1
         spec_type = '多规格' if is_multi else '单规格'
+        assert spec_type in LOCKED_SPEC_TYPES
         if is_multi:
             multi_spu_count += 1
 
@@ -295,6 +338,7 @@ def build_excel(spus_jsonl, cat_json, out_xlsx):
                 attrs_str,
                 main_pic
             ]
+            assert len(row_data) == 27, f"Row length must be 27, got {len(row_data)}"
             ws.append(row_data)
             total_sku_rows += 1
             if is_multi:
@@ -307,12 +351,19 @@ def build_excel(spus_jsonl, cat_json, out_xlsx):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Export Meituan H5 Competitor JSONL to Single-Sheet Excel')
+    parser = argparse.ArgumentParser(description='Export Meituan H5 Competitor JSONL to Single-Sheet 27-Col Excel')
     parser.add_argument('--spus-jsonl', required=True, help='Path to spus.jsonl')
     parser.add_argument('--cat-json', default=None, help='Path to categories.json')
-    parser.add_argument('--out-xlsx', required=True, help='Output Excel path')
+    parser.add_argument('--out-xlsx', default=None, help='Explicit output Excel path (optional if --out-dir and --store-name are given)')
+    parser.add_argument('--out-dir', default='.', help='Output directory when auto-naming {MMDD}{店铺名称}.xlsx')
+    parser.add_argument('--store-name', default='', help='Store name for locked {MMDD}{店铺名称}.xlsx naming convention')
+    parser.add_argument('--date-mmdd', default=None, help='Optional MMDD override (defaults to today MMDD)')
     args = parser.parse_args()
-    build_excel(args.spus_jsonl, args.cat_json, args.out_xlsx)
+
+    out_xlsx = args.out_xlsx
+    if not out_xlsx:
+        out_xlsx = format_locked_excel_path(args.out_dir, args.store_name, args.date_mmdd)
+    build_excel(args.spus_jsonl, args.cat_json, out_xlsx)
 
 
 if __name__ == '__main__':

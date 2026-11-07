@@ -15,9 +15,10 @@ import time
 import random
 import argparse
 import urllib.request
+import asyncio
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
-import websocket
+import websockets
 
 
 def clean_pic_url(url):
@@ -40,7 +41,7 @@ def get_store_ws_url(port=9222):
     targets = json.loads(urllib.request.urlopen(f'http://127.0.0.1:{port}/json/list').read().decode())
     for t in targets:
         u = t.get('url', '')
-        if 'wx-shangou.meituan.com' in u or 'h5.waimai.meituan.com' in u:
+        if 'cactivityapi-sc.waimai.meituan.com' in u or 'wx-shangou.meituan.com' in u or 'h5.waimai.meituan.com' in u:
             return t['webSocketDebuggerUrl'], u
     raise RuntimeError(f'No open Meituan H5 store tab found on port {port}')
 
@@ -48,31 +49,30 @@ def get_store_ws_url(port=9222):
 class StoreDetailClient:
     def __init__(self, port=9222):
         self.port = port
-        self.ws = None
+        self.ws_url = None
         self.msg_id = 1
         self.req_count = 0
         self.connect()
 
     def connect(self):
-        if self.ws:
-            try:
-                self.ws.close()
-            except Exception:
-                pass
-        ws_url, _ = get_store_ws_url(self.port)
-        self.ws = websocket.create_connection(ws_url, timeout=30)
+        self.ws_url, _ = get_store_ws_url(self.port)
         # Preserve default download filenames per Mac browser rule
         self.cdp('Browser.setDownloadBehavior', {'behavior': 'default'})
 
     def cdp(self, method, params=None):
         self.msg_id += 1
         cur_id = self.msg_id
-        self.ws.send(json.dumps({'id': cur_id, 'method': method, 'params': params or {}}))
-        while True:
-            raw = self.ws.recv()
-            data = json.loads(raw)
-            if data.get('id') == cur_id:
-                return data
+
+        async def _call():
+            async with websockets.connect(self.ws_url, max_size=50*1024*1024) as ws:
+                await ws.send(json.dumps({'id': cur_id, 'method': method, 'params': params or {}}))
+                while True:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                    data = json.loads(raw)
+                    if data.get('id') == cur_id:
+                        return data
+
+        return asyncio.run(_call())
 
     def eval_js(self, expr, await_promise=True):
         res = self.cdp('Runtime.evaluate', {
