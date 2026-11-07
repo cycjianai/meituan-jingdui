@@ -1,4 +1,4 @@
-# 美团 H5 闪购（`wx-shangou`）风控机制剖析与防 418 压测手册
+# 美团 H5 闪购（`wx-shangou`）风控机制剖析与防 418 / 防 403 压测手册
 
 ## 一、核心底层架构发现
 
@@ -8,39 +8,50 @@
 3. 页面数据接口直连 `https://wx-shangou.meituan.com/quickbuy/v1/*`，主要包括：
    - `/quickbuy/v1/poi/food`：进店首包（约 1.3 MB），包含门店信息 `poi_info`、全店一级与二级分类树 `food_spu_tags`（含 70+ 个一级分类及 400+ 个子分类）；
    - `/quickbuy/v1/poi/sputag/products`：按分类 ID 拉取该分类下的**全量排序商品 ID 数组（`allSortedSpuId`）**及前 20 个商品详情；
-   - `/quickbuy/v1/poi/product/smooth/render`：按传入的 `spuIds` 数组批量返回完整的商品 SPU 与子 SKU 结构化详情（**注意：虽然前端 JS 切片上限写为 50，但服务端实际单次最多返回 30 个 SPU！必须按 30 个/批动态计算剩余未采集 ID，否则每批会漏掉后 20 个商品并产生跳跃式异常请求特征**）。
+   - `/quickbuy/v1/poi/product/smooth/render`：按传入的 `spuIds` 数组批量返回完整的商品 SPU 与子 SKU 结构化详情。
 
 ---
 
-## 二、为什么普通脚本/小程序快刷必中 `HTTP 418`（Yoda 验证中心）？
+## 二、美团双层频次风控红线（`HTTP 418` 滑块 vs `HTTP 403` 临时封禁）
 
-在两轮真实压力测试中，我们精确测出了触发 `HTTP 418`（跳转 `https://verify.meituan.com/v2/app/general_page`）的 5 个边界条件：
+通过多轮极限压测与逆向前端源码（`main_app/app-service.attached.ed184652.js`、`sub-trade/app-service.attached.4a8e6519.js`），我们精准摸清了美团网关的两层频次限制与四项机器人特征识别机制：
 
-1. **DevTools 窗口开启触发反调试陷阱**
-   - 若针对 H5 标签页打开了 Chrome `DevTools` 窗口（`devtools://...`），`H5guard` 会检测到调试器并挂起或标记风险。采集前必须通过 `/json/close/<devtoolsTargetId>` 关闭 DevTools 标签页。
-2. **连续调用 `spuTagProducts` 超过 55~60 次且无分类点击埋点与 `smoothRender` 配合**
-   - 第一轮压测中，连续 60 次仅调用 `requestSpusAndSortedIds`（速率 ~2.0 秒/次，无鼠标移动、无 `_lxFirstCategoryClick`、无 `smoothRender`），在第 60 个分类时触发 `Status code not 200[418]`。
-   - **原因**：真人浏览单个分类时，会先触发灵犀埋点 `_lxFirstCategoryClick(idx)`（上报 `bid: "b_g16gkfb4"`），接着拉取首屏 `spuTagProducts`，随后下滑触发 `smoothRender`。
-3. **`smoothRender` 批次大小不匹配导致 ID 跳跃特征**
-   - 前端 `_requestSmoothMenuData` 在首屏 20 个商品后，每次请求 30 个商品（服务端硬上限 30 个/次）。若脚本按 50 个切片并固定 `b_start += 50`，不仅会漏采 40% 的分页商品，还会向服务端发送不连续的跳跃式 `spuIds`（如跳过第 50~69 个直接请求第 70~119 个），极易触发风控异常识别。
-4. **缺少 DOM 行为生物探针上报（`msp.meituan.com/fingerprint/v1/notapp/bio/info/report`）**
-   - 页面内的 `H5guard` 持续收集 `document` / `window` 上的 `mousemove`、`mousedown`、`mouseup`、`click`、`scroll` 事件并周期性上报 `bio/info/report`。
-   - **macOS 踩坑铁律**：在 macOS 下，当 Chrome 窗口处于后台或被遮挡时，调用 CDP 的 `Input.dispatchMouseEvent(type="mouseWheel")` 会因为等待渲染合成器（Compositor）帧确认而永久阻塞 `ws.recv()`。因此**必须通过 `Runtime.evaluate` 在 JS 内部使用 `document.dispatchEvent(new MouseEvent(...))` 与 `window.dispatchEvent(new Event('scroll'))` 注入事件**，既不阻塞后台运行，又能被 `H5guard` 正常采集。
-5. **2 分钟滑动窗口请求上限（~28–30 次请求）**
-   - 第二轮压测证实：进店首屏自带约 4~5 次底层请求，此后在连续请求（含 10 秒短停顿）累计达到第 **29~30 次**（加上进店首屏共约 34 次请求/2分钟）时会触发滑动窗口阈值。短于 15 秒的停顿无法清零网关的 2 分钟滑动窗口计数器，必须在每 **18~20 次请求**后执行一次 **38~48 秒** 的窗口清零休眠。
+### 2.1 第一层：2 分钟滑动窗口频次门禁（触发 `HTTP 418` -> `verify.meituan.com` 点选/滑块验证）
+- **实测触发点**：
+  - 当任意 **120 秒（2 分钟）滑动窗口**内的接口请求数达到 **15 ~ 24 次**（平均间隔 $< 6$ 秒）时，网关返回 `Status code not 200[418]` 并跳转 `verify.meituan.com`。
+- **安全红线**：
+  - 单次请求间隔控制在 **`11.5 ~ 16.5 秒`**，每 **5 次请求**小憩 **`22 ~ 32 秒`**，每 **15 次请求**冷却 **`75 ~ 90 秒`**，使任意 2 分钟窗口内请求数严格 $\le 7$ 次，即可连续几十次请求 **0 次触发 `418`**（实测从第 29 次连续跑到第 112 次请求共采 2,103 个 SPU 零 `418`）。
+
+### 2.2 第二层：30 分钟 / 1 小时累计会话配额门禁（触发 `HTTP 403` 临时静默封禁）
+- **实测触发点**：
+  - 在避开 2 分钟 `418` 窗口后，若以 ~3.1 次/分钟（约 185 次/小时）的速度连续不间断请求，在累计达到 **第 113 次请求**（单会话 45 分钟内累计约 145~150 次请求）时，网关不再弹 `418` 验证码，而是直接返回 **`Status code not 200[403]: request:ok`**！
+  - **关键机制**：`403` 不会跳转 `verify.meituan.com`，而是由前端捕获后在页面弹出报错 Toast。若此时脚本不立即熔断停止、继续每秒/每十秒重试，会不断刷新 WAF 的封禁计时器！
+- **安全红线（为什么慢爬一天能稳抓 4~5 家大店）**：
+  - 一家 7,500 SPU 的大型超市（约 68 个实体分类），全店共需约 `68` 次 `spuTagProducts`（带出 ~1,360 品）+ `200` 次 `smoothRender`（每批返回 30 品，带出 ~6,000 品）= **合计约 265~270 次请求即可抓完一整家大店**。
+  - 只要将每小时请求量严格踩在 **`85 ~ 95 次/小时`**（即平均每分钟 $1.5$ 次请求，每满 **40 次请求**主动休息 **`3.5 ~ 4.3 分钟`**）：
+    - 抓完一整家 7,500 品大店约需 **2.2 ~ 2.5 小时**，全程既不触发 `418` 也不触发 `403`；
+    - 一天 10~12 小时可稳健抓完 **4 ~ 5 家大型超市（3~4 万个商品）**！
 
 ---
 
-## 三、零封控、高吞吐的标准采集参数（已固化至 `crawl_h5_store.py`）
+## 三、逆向前端源码发现的 4 项“机器人行为特征”及修复方案
 
-1. **分类遍历顺序**：
-   - 先遍历 `idx >= 7` 的实体商品分类（如 `杜蕾斯`、`玛氏专区`、`饮料专区`...），再遍历 `idx < 7` 的促销聚合分类（跳过纯领券分类 `idx == 2`）。
-   - 因为促销分类 99% 的商品已包含在实体分类中，全局 `seen_spus` 去重可直接省去 25% 以上的冗余请求。
-2. **单分类内闭环 + 30 个/批动态差集拉取**：
-   - 每个一级分类取 `sub_idx = 0`（即 `全部` 视图，已实测验证 `全部` 视图的 `allSortedSpuId` 100% 包含该分类下所有二级子分类的全部商品 ID，0 遗漏）。
-   - 拿到 `allSortedSpuId` 后，实时计算 `missing_ids = [x for x in all_ids if x not in seen_spus]`，每次取前 **30 个 SPU ID** 调用 `requestSmoothSpus`，确保 100% 连续无遗漏。
-3. **三级呼吸限速（20 请求滑动窗口清零机制）**：
-   - 每次请求前：注入 6 步 DOM 鼠标轨迹 + 点击 + 滚动事件，随机间隔 `3.5 ~ 5.2 秒`；
-   - 每满 **8 次请求**：小憩 `9.0 ~ 13.0 秒`；
-   - 第 **18 次请求**及此后每满 **20 次请求**：执行 `38.0 ~ 48.0 秒` 的滑动窗口清零休息（期间穿插鼠标移动）。
-   - 若遇到验证页（`verify.meituan.com`），脚本自动挂起等待并在用户完成点选/滑块后从断点无缝续传，0 数据丢失。
+除请求速度外，逆向 `smooth-render.js` 与 `/api/rohr.js` 发现了裸调页面函数时的 4 个机器人暴露特征，已在 `crawl_h5_store.py` 中全部修复：
+
+1. **特征 1：`requestSmoothSpus` 传入的 `spuIds` 数组长度异常（30 vs 50）**
+   - **源码真相**：在 `smooth-render.js` 的 `_requestSmoothMenuData` 中，官方前端代码写死为 `g = m.slice(f + 1, f + 50 + 1)`，即**前端每次固定向 `smooth/render` 发送最多 50 个 SPU ID**，服务端截取并返回其中前 30 个商品；下次滚动时前端从第 30 个商品之后继续切片发送 50 个 ID。
+   - **修复**：脚本每次向 `requestSmoothSpus` 传入 `missing_ids[:50]`（与官方前端请求包体 100% 一致），同时按服务端实际返回的 30 个商品更新 `seen_spus`，下一次自动从第 31 个未采 ID 起再传 50 个 ID。
+
+2. **特征 2：只调底层数据请求、不更新 UI 分类高亮与商品卡片渲染（0 图片加载异常）**
+   - **源码真相**：真人点击分类下滑时，会触发 `_highlightTag(idx, sub_idx)`（更新 `activeTypeIndex` 并上报二级分类曝光 `_lxSecondCategoryView`）以及 `setList(0, 10, showList, "smoothRender.showList", true)`（将商品渲染到 DOM 并触发浏览器加载 `p0.meituan.net` 商品缩略图）。若连续发出 100+ 次 API 请求却从不切换 UI 分类、从不加载任何商品图片，极易被识别为无头/内存脚本。
+   - **修复**：每次切换分类时同步调用 `p._highlightTag(idx, sub_idx, false)`，每次拉回批次商品后调用 `p.setList(0, 6, matched, "smoothRender.showList", true)` 驱动页面真实渲染商品卡片并加载缩略图。
+
+3. **特征 3：`/api/rohr.js` 的移动端触摸轨迹数组（`mT`、`tT`、`aT`）为空**
+   - **源码真相**：在 `main_app/app-service.attached.ed184652.js` 的 `/api/rohr.js` 中，防爬签名对象 `k = {rId: 100016, mT: [], kT: [], aT: [], tT: []}` 通过 `handleTouchMove(e)` 收集 `e.touches[0].clientX/clientY` 填入 `mT` 和 `tT`。仅派发桌面端 `MouseEvent('mousemove')` 不会填充 `Touches` 轨迹。
+   - **修复**：在 `simulate_human_interaction` 中同时触发 `p._onTouchMove({touches: [{clientX, clientY}], changedTouches: [...]})` 与 `MouseEvent` / `scroll`。
+
+4. **特征 4：验证回跳后 URL 残留过期参数（`code=121044&request_code=...&response_code=...`）及 `403` 循环重试**
+   - **源码真相**：当 `verify.meituan.com` 回跳门店页后，URL 与 `p.options` 中会残留 `request_code`、`response_code` 甚至 `code=121044（授权码已过期）`，随后续每次请求头上报。且当触发 `403` 时若不立即停止，连续重试会延长封禁时间。
+   - **修复**：
+     - 每次就绪检查时通过 `history.replaceState` 与 `delete p.options[k]` 自动清理残留验证参数；
+     - **硬熔断机制（Circuit Breaker）**：一旦捕获 `403` / `406` / `418`，立即落盘导出当前 Excel 并停止请求，绝不循环重试刷报错弹窗。

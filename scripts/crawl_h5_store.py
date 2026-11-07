@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Meituan Shangou (H5 -> wx-shangou) Full-Store Anti-418 Crawler
+Meituan Shangou (H5 -> wx-shangou) Full-Store Anti-418 & Anti-403 Crawler
 Part of the `meituanjingdui` skill.
 """
 import os
@@ -55,27 +55,72 @@ async def eval_js(ws, msg_id, expr, timeout=25.0):
 
 
 async def simulate_human_interaction(ws, msg_seq, is_category_switch=False):
-    """Emit realistic DOM mouse/touch/scroll events inside JS so H5guard bio/info/report sees human activity."""
+    """
+    Emit realistic DOM touch + mouse + scroll events inside JS so both:
+    - H5guard (`bio/info/report`)
+    - `/api/rohr.js` (`handleTouchMove`, `handleTap` -> `mT`, `tT`, `aT`)
+    record genuine human touch/scroll trajectories.
+    """
     msg_seq += 1
     await eval_js(ws, msg_seq, '''
     (async () => {
-        const x0 = Math.floor(150 + Math.random() * 200);
-        const y0 = Math.floor(220 + Math.random() * 350);
-        const x1 = Math.floor(60 + Math.random() * 280);
-        const y1 = Math.floor(200 + Math.random() * 400);
+        const x0 = Math.floor(140 + Math.random() * 180);
+        const y0 = Math.floor(380 + Math.random() * 220);
+        const x1 = Math.floor(130 + Math.random() * 190);
+        const y1 = Math.floor(180 + Math.random() * 180);
         const steps = 6;
+        const p = typeof getCurrentPages === 'function' && getCurrentPages()[0];
+
         for (let i = 1; i <= steps; i++) {
             const t = i / steps;
             const cx = Math.floor(x0 + (x1 - x0) * t + (Math.random() * 6 - 3));
             const cy = Math.floor(y0 + (y1 - y0) * t + (Math.random() * 6 - 3));
             document.dispatchEvent(new MouseEvent('mousemove', {clientX: cx, clientY: cy, bubbles: true}));
             window.dispatchEvent(new MouseEvent('mousemove', {clientX: cx, clientY: cy, bubbles: true}));
-            await new Promise(r => setTimeout(r, 25));
+            try {
+                if (p && typeof p._onTouchMove === 'function') {
+                    p._onTouchMove({touches: [{clientX: cx, clientY: cy}], changedTouches: [{clientX: cx, clientY: cy}]});
+                }
+            } catch (e) {}
+            await new Promise(r => setTimeout(r, 35));
         }
         document.dispatchEvent(new MouseEvent('mousedown', {clientX: x1, clientY: y1, bubbles: true}));
         document.dispatchEvent(new MouseEvent('mouseup', {clientX: x1, clientY: y1, bubbles: true}));
         document.dispatchEvent(new MouseEvent('click', {clientX: x1, clientY: y1, bubbles: true}));
         window.dispatchEvent(new Event('scroll', {bubbles: true}));
+        return true;
+    })()
+    ''')
+    return msg_seq
+
+
+async def clean_verify_url_params(ws, msg_seq):
+    """Strip residual verify callback params (`code=121044`, `request_code`, `response_code`) from URL and page options."""
+    msg_seq += 1
+    await eval_js(ws, msg_seq, '''
+    (() => {
+        try {
+            const u = new URL(location.href);
+            let changed = false;
+            for (const k of ['code', 'msg', 'response_code', 'request_code', 'responseCode', 'requestCode']) {
+                if (u.searchParams.has(k)) {
+                    u.searchParams.delete(k);
+                    changed = true;
+                }
+            }
+            if (changed) {
+                history.replaceState(null, '', u.toString());
+            }
+            const p = typeof getCurrentPages === 'function' && getCurrentPages()[0];
+            if (p && p.options) {
+                for (const k of ['code', 'msg', 'response_code', 'request_code', 'responseCode', 'requestCode']) {
+                    delete p.options[k];
+                }
+            }
+            if (p && p.setData) {
+                p.setData({'toast.show': false});
+            }
+        } catch (e) {}
         return true;
     })()
     ''')
@@ -108,6 +153,7 @@ async def wait_until_store_ready(ws, msg_seq, expected_poi_id_str=None):
             and 'verify.meituan.com' not in state.get('url', '')
             and (not expected_poi_id_str or state.get('poiIdStr') == expected_poi_id_str)
         ):
+            msg_seq = await clean_verify_url_params(ws, msg_seq)
             if logged_wait:
                 print(f"[RESUMED] Store page ready again: {state.get('poiName')} ({state.get('poiIdStr')})", flush=True)
             return msg_seq, state
@@ -115,31 +161,41 @@ async def wait_until_store_ready(ws, msg_seq, expected_poi_id_str=None):
         if not logged_wait:
             print(f"[WAIT_READY] Waiting for store page / verification completion (url={state.get('url', '')[:80]}...)", flush=True)
             logged_wait = True
-        await asyncio.sleep(3.0)
+        await asyncio.sleep(5.0)
 
 
 async def adaptive_sleep(ws, msg_seq, req_counter, is_category_switch=False):
     """
-    Rolling-120s-Window Anti-418 Pacing:
-    - Meituan's gateway enforces a strict 120-second rolling window cap of ~24 requests.
-    - By spacing requests at 5.2~7.2s, pausing 14~20s every 6 requests, and resting 65~75s every 15 requests,
-      any 120-second rolling window contains at most 14~15 requests, permanently staying below the 418 threshold.
+    Safe-Boundary Anti-418 & Anti-403 Pacing Model:
+    1. Tier-1 (2-min window < 10 reqs to prevent 418 Captcha):
+       - Base interval: 11.5 ~ 16.5s per request
+       - Every 5 requests: breather 22 ~ 32s
+       - Every 15 requests: 2-minute window cooldown 75 ~ 90s
+       -> Max 6~7 requests inside any 120s window (safely under the 15~20 request 418 line).
+    2. Tier-2 (Hourly session < 95 reqs to prevent 403 Block):
+       - Every 40 requests (~20 mins): session rest 210 ~ 260s (3.5~4.3 mins)
+       -> Sustained rate ~90 requests/hour (safely under the ~115-150 req/hour 403 line).
     """
     msg_seq = await simulate_human_interaction(ws, msg_seq, is_category_switch=is_category_switch)
-    base_delay = random.uniform(5.2, 7.2)
+    base_delay = random.uniform(11.5, 16.5)
     await asyncio.sleep(base_delay)
 
-    if req_counter > 0 and req_counter % 15 == 0:
-        cooldown = random.uniform(65.0, 75.0)
-        print(f"  [Anti-418 Rolling-Window Reset] Reached {req_counter} requests, resting {cooldown:.1f}s so 120s window ages out...", flush=True)
+    if req_counter > 0 and req_counter % 40 == 0:
+        session_rest = random.uniform(210.0, 260.0)
+        print(f"  [Anti-403 Hourly Quota Rest] Reached {req_counter} requests, resting {session_rest:.1f}s to stay below hourly 403 ceiling...", flush=True)
+        chunk = session_rest / 4.0
+        for _ in range(4):
+            await asyncio.sleep(chunk)
+            msg_seq = await simulate_human_interaction(ws, msg_seq, is_category_switch=False)
+    elif req_counter > 0 and req_counter % 15 == 0:
+        cooldown = random.uniform(75.0, 90.0)
+        print(f"  [Anti-418 2-Min Window Reset] Reached {req_counter} requests, resting {cooldown:.1f}s...", flush=True)
         third = cooldown / 3.0
-        await asyncio.sleep(third)
-        msg_seq = await simulate_human_interaction(ws, msg_seq, is_category_switch=False)
-        await asyncio.sleep(third)
-        msg_seq = await simulate_human_interaction(ws, msg_seq, is_category_switch=False)
-        await asyncio.sleep(third)
-    elif req_counter > 0 and req_counter % 6 == 0:
-        pause = random.uniform(14.0, 20.0)
+        for _ in range(3):
+            await asyncio.sleep(third)
+            msg_seq = await simulate_human_interaction(ws, msg_seq, is_category_switch=False)
+    elif req_counter > 0 and req_counter % 5 == 0:
+        pause = random.uniform(22.0, 32.0)
         print(f"  [Breather] {req_counter} requests, pausing {pause:.1f}s...", flush=True)
         await asyncio.sleep(pause)
 
@@ -276,6 +332,7 @@ async def run_crawler(args):
                         'tag': cached_check['tag'],
                         'type': cached_check['type'],
                         'sub_idx': sub_idx,
+                        'sub_tags': m.get('sub_tags', []),
                         'allSortedSpuId': cached_check['allSortedSpuId']
                     }
                     with open(cat_map_json, 'w', encoding='utf-8') as cf:
@@ -294,11 +351,20 @@ async def run_crawler(args):
                             if (typeof p._lxFirstCategoryClick === 'function') {{
                                 p._lxFirstCategoryClick({idx});
                             }}
+                            if (typeof p._highlightTag === 'function') {{
+                                p._highlightTag({idx}, {sub_idx}, false);
+                            }}
                             await p.requestSpusAndSortedIds({idx}, {sub_idx}, c.tag, c.type, 0, true);
                         }} catch (err) {{
                             return {{error: String(err.message || err)}};
                         }}
                         const c2 = p._getCachedData({idx}, {sub_idx});
+                        try {{
+                            if (c2.spus && c2.spus.length > 0 && typeof p.setList === 'function') {{
+                                const renderObj = p.setList(0, 6, c2.spus, "smoothRender.showList", true);
+                                p.setData(Object.assign({{"smoothRender.scrollTop": 0, "smoothRender.currentItemIndex": 0}}, renderObj));
+                            }}
+                        }} catch (e) {{}}
                         return {{
                             tag: c2.tag,
                             type: c2.type,
@@ -310,9 +376,13 @@ async def run_crawler(args):
                     ''')
 
                     if res and res.get('error'):
-                        print(f"[WARN] Category [{idx}] {name} spuTagProducts error: {res['error']}", flush=True)
-                        await asyncio.sleep(5.0)
-                        msg_seq, _ = await wait_until_store_ready(ws, msg_seq, actual_poi_id)
+                        err_msg = str(res['error'])
+                        print(f"[CIRCUIT_BREAKER] Category [{idx}] {name} spuTagProducts error: {err_msg}", flush=True)
+                        out_f.flush()
+                        if '403' in err_msg or '406' in err_msg or '418' in err_msg:
+                            print(f"[STOP_ON_RISK_CONTROL] Halting immediately on {err_msg} to avoid extending block penalty.", flush=True)
+                            sys.exit(43)
+                        await asyncio.sleep(10.0)
                         continue
 
                     all_ids = (res or {}).get('allSortedSpuId') or []
@@ -329,9 +399,10 @@ async def run_crawler(args):
                     }
                     with open(cat_map_json, 'w', encoding='utf-8') as cf:
                         json.dump(cat_map, cf, ensure_ascii=False, indent=2)
-                    print(f"[{step_num}/{len(ordered_tabs)}] Cat[{idx}] {name}: {len(all_ids)} total IDs, +{added} initial SPUs (unique={len(seen_spus)})", flush=True)
+                    print(f"[{step_num}/{len(ordered_tabs)}] Cat[{idx}] {name}: {len(all_ids)} total IDs, +{added} initial SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
 
-            # Fetch remaining unfetched SPU IDs in exact server-capped batches of 30
+            # Fetch remaining unfetched SPU IDs: send slice of up to 50 IDs (matching genuine smooth-render.js),
+            # while server returns first 30.
             cinfo = cat_map.get(str_idx) or {}
             all_ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
             batch_idx = 0
@@ -339,14 +410,15 @@ async def run_crawler(args):
                 missing_ids = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
                 if not missing_ids:
                     break
-                batch = missing_ids[:30]
+                batch_50 = missing_ids[:50]
+                expected_first_30 = missing_ids[:30]
                 batch_idx += 1
 
                 req_counter += 1
                 msg_seq = await adaptive_sleep(ws, msg_seq, req_counter, is_category_switch=False)
                 msg_seq, _ = await wait_until_store_ready(ws, msg_seq, actual_poi_id)
 
-                batch_json = json.dumps(batch)
+                batch_json = json.dumps(batch_50)
                 msg_seq += 1
                 res = await eval_js(ws, msg_seq, f'''
                 (async () => {{
@@ -354,6 +426,9 @@ async def run_crawler(args):
                     const c = p._getCachedData({idx}, {sub_idx});
                     const targetIds = {batch_json};
                     try {{
+                        if (typeof p._highlightTag === 'function' && p.data.activeTypeIndex !== {idx}) {{
+                            p._highlightTag({idx}, {sub_idx}, false);
+                        }}
                         await p.requestSmoothSpus(targetIds, {idx}, {sub_idx}, c.tag, c.type, c.extra, true);
                     }} catch (err) {{
                         return {{error: String(err.message || err)}};
@@ -361,19 +436,29 @@ async def run_crawler(args):
                     const c2 = p._getCachedData({idx}, {sub_idx});
                     const idSet = new Set(targetIds);
                     const matched = (c2.spus || []).filter(s => s && idSet.has(Number(s.id)));
+                    try {{
+                        if (matched.length > 0 && typeof p.setList === 'function') {{
+                            const renderObj = p.setList(0, Math.min(6, matched.length), matched, "smoothRender.showList", true);
+                            p.setData(renderObj);
+                        }}
+                    }} catch (e) {{}}
                     return {{spus: matched}};
                 }})()
                 ''')
 
                 if res and res.get('error'):
-                    print(f"  [WARN] Cat[{idx}] {name} batch {batch_idx} error: {res['error']}", flush=True)
-                    await asyncio.sleep(5.0)
-                    msg_seq, _ = await wait_until_store_ready(ws, msg_seq, actual_poi_id)
+                    err_msg = str(res['error'])
+                    print(f"  [CIRCUIT_BREAKER] Cat[{idx}] {name} batch {batch_idx} error: {err_msg}", flush=True)
+                    out_f.flush()
+                    if '403' in err_msg or '406' in err_msg or '418' in err_msg:
+                        print(f"  [STOP_ON_RISK_CONTROL] Halting immediately on {err_msg} to avoid extending block penalty.", flush=True)
+                        sys.exit(43)
+                    await asyncio.sleep(10.0)
                     continue
 
                 spus = (res or {}).get('spus') or []
                 returned_ids = {int(s['id']) for s in spus if isinstance(s, dict) and s.get('id')}
-                for bid in batch:
+                for bid in expected_first_30:
                     if bid not in returned_ids:
                         unfetchable_ids.add(bid)
 
@@ -403,7 +488,7 @@ async def run_crawler(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Meituan H5 Shangou Anti-418 Store Crawler')
+    parser = argparse.ArgumentParser(description='Meituan H5 Shangou Anti-418 & Anti-403 Store Crawler')
     parser.add_argument('--port', type=int, default=9222, help='Chrome remote debugging port')
     parser.add_argument('--poi-id-str', type=str, default=None, help='Expected poi_id_str (optional)')
     parser.add_argument('--poi-name', type=str, default=None, help='Expected store name substring (optional)')

@@ -33,33 +33,31 @@ description: 美团闪购/超市便利竞对门店全量高维数据采集与比
 
 ---
 
-## 3. 美团 H5 闪购（`wx-shangou`）风控机制与防 418 压测铁律
+## 3. 美团 H5 闪购（`wx-shangou`）双层风控红线与防 418 / 防 403 压测铁律
 
-通过实战压力测试查明，美团 H5 闪购内嵌 Web 小程序（`reco_fe_shangchao_wxapp`）存在以下两道核心风控门禁，**必须严格按本规范规避**：
+通过实战压力测试与逆向前端包（`main_app/app-service.attached.ed184652.js`、`sub-trade/app-service.attached.4a8e6519.js`）查明，美团 H5 闪购存在**两道频次风控红线**与**四项前端机器人特征校验**，必须严格踩在红线内请求：
 
-### 3.1 为什么裸调接口或小程序快刷会触发 `HTTP 418`（滑块验证）？
-1. **缺少灵犀（Lingxi）分类点击埋点与行为序列异常**：
-   - 真人浏览时，点击左侧分类会先上报 `_lxFirstCategoryClick(idx)`（`bid: "b_g16gkfb4"`），随后调用 `spuTagProducts` 拉取该类前 20 个商品与全量排序 ID（`allSortedSpuId`），紧接着在该分类内下滑调用 `smoothRender` 分批渲染剩余商品。
-   - 若脚本连续 60 次只调 `spuTagProducts` 而不调 `_lxFirstCategoryClick`、也不在分类内调用 `smoothRender`，会在第 55~60 次请求时直接触发 `418` 滑块拦截。
-2. **缺少 DOM 生物行为探针数据（`bio/info/report`）**：
-   - `msp.meituan.com/fingerprint/v1/notapp/bio/info/report` 持续监听页面内的 `mousemove`、`mousedown`、`mouseup`、`click`、`scroll` 事件；连续无交互请求会被判定为脚本。
-   - **注意**：在 macOS 上不要使用 CDP `Input.dispatchMouseEvent(type="mouseWheel")`，当浏览器处于后台时会被 macOS 窗口合成器挂起导致超时；**必须在 `Runtime.evaluate` 内通过 `document.dispatchEvent(new MouseEvent(...))` 和 `window.dispatchEvent(new Event('scroll'))` 注入原生 DOM 事件**。
-3. **2 分钟滑动窗口请求频次上限（~28–30 次请求门禁）与 `smoothRender` 30品批次约束**：
-   - 进店首屏自带约 4~5 次底层请求，此后连续请求（即使穿插 10 秒短停顿）累计达到第 **29~30 次**时会触发滑动窗口门禁返回 `418`。
-   - 同时，`/quickbuy/v1/poi/product/smooth/render` 服务端硬上限为 **单次返回 30 个 SPU**（虽然前端 JS 写 `slice(0, 50)`，但服务端只返回前 30 个）。必须按 **30 个 SPU/批** 动态取未采集差集 `missing_ids[:30]`，绝不能按 50 步进导致漏采和 ID 跳跃异常。
+### 3.1 两道频次风控红线（2 分钟 `418` 滑块 vs 1 小时 `403` 临时封禁）
+1. **第一层：2 分钟滑动窗口频次红线（触发 `HTTP 418` -> `verify.meituan.com` 验证码）**：
+   - 当 120 秒（2 分钟）滑动窗口内请求达到 **15 ~ 24 次**（平均间隔 $< 6$ 秒）时，触发 `418` 验证码。
+   - **安全踩线值**：单次请求间隔 **`11.5 ~ 16.5 秒`**，每 **5 次请求**小憩 **`22 ~ 32 秒`**，每 **15 次请求**冷却 **`75 ~ 90 秒`**（确保任意 2 分钟窗口内请求数 $\le 7$ 次，实测连续 84 次请求 0 次触发 `418`）。
+2. **第二层：30 分钟 / 1 小时累计会话配额红线（触发 `HTTP 403` 静默封禁，不跳验证页但弹报错 Toast）**：
+   - 若以 ~3.1 次/分钟（~185 次/小时）的速度连续不间断请求，当单次会话在 35~45 分钟内累计达到 **110 ~ 145 次请求**时，WAF 会直接返回 **`Status code not 200[403]`** 临时封禁接口。
+   - **安全踩线值（为什么慢爬一天能稳抓 4~5 家大店）**：
+     - 一家 7,500 SPU 的大店（~68 个实体分类）共需约 `68` 次 `spuTagProducts` + `200` 次 `smoothRender` = **约 265~270 次请求**。
+     - 只要每满 **40 次请求**主动休息 **`210 ~ 260 秒`（3.5 ~ 4.3 分钟）**，将小时请求量严格控制在 **`85 ~ 95 次/小时`**，2.3 小时即可零封控抓完一整家 7,500 品大店，一天可稳抓 4~5 家大店。
+   - **触发 `403` 后的熔断与 30 分钟解封探针机制**：
+     - 一旦捕获 `403` / `406` / `418`，**立即停止请求并导出已采数据**（绝不循环重试刷新封禁计时器），每隔 **30 分钟**发送 1 次单请求探针检测是否解封，解封后自动从断点续传。
 
-### 3.2 极速且零封控的标准采集架构（支持一天稳定连爬多家门店）
-1. **分类遍历顺序优化（先爬实体分类 `idx >= 7`，最后补齐活动分类 `0..6`）**：
-   - 门店前 7 个分类通常为 `推荐`、`神价`、`活动`、`疯狂折扣` 等聚合活动区（99% 商品与实体分类重复）。
-   - **先遍历 `idx >= 7` 的实体一级分类**：既能确保每个商品落入真实的店内一级分类（如 `饮料专区`、`生活用水`、`五金家装`），又能在最后扫描活动分类时通过全局 `seen_spus` 自动跳过已抓商品，减少约 25% 冗余请求。
-2. **单分类“全部”视图一次拿齐 ID + 30 品/批动态差集拉取**：
-   - 对每个一级分类 `idx`，取其 `全部` 子标签（`sub_idx = 0 if p._ifHasSubTag(idx) else -1`），调用 1 次 `requestSpusAndSortedIds` 即可拿到该一级分类下**全部子分类的 100% 排序商品 ID（`allSortedSpuId`）**及前 20 个商品详情，无需逐个点击二级子分类。
-   - 对该分类剩余未采集的 `allSortedSpuId`，动态计算 `missing_ids = [x for x in all_ids if x not in seen_spus]`，每次取前 **30 个 SPU** 调用 `p.requestSmoothSpus(batchOf30, idx, sub_idx, c.tag, c.type, c.extra, true)`，确保 100% 连续无遗漏。
-3. **自适应呼吸限速（20 请求滑动窗口清零机制）**：
-   - 每次请求前注入 6 步 DOM 鼠标轨迹与滚动事件，基础间隔 `3.5 ~ 5.2 秒`；
-   - 每满 **8 次请求** 小憩 `9 ~ 13 秒`；
-   - 第 **18 次请求**及此后每满 **20 次请求**（远低于 29~30 次触发阈值）执行一次 `38 ~ 48 秒` 的滑动窗口清零休息；
-   - 全程增量写入 `*.jsonl` 断点文件，若偶发点选/滑块验证（`verify.meituan.com`），自动暂停等待验证通过后从当前批次无缝续传。
+### 3.2 逆向源码修复的 4 项机器人特征（已固化至 `crawl_h5_store.py`）
+1. **`requestSmoothSpus` 传参长度必须与官方前端 `smooth-render.js` 一致（传 50 个 ID，收 30 个商品）**：
+   - 官方前端 `_requestSmoothMenuData` 固定执行 `g = m.slice(f + 1, f + 50 + 1)` 传入最多 **50 个 ID**，服务端截取返回前 **30 个商品**。脚本必须同样传入 `missing_ids[:50]`，并按实际返回的 30 个商品推进 `seen_spus`。
+2. **同步驱动 UI 分类高亮与 DOM 商品卡片渲染（消除“百次请求 0 图片加载”特征）**：
+   - 切换分类时调用 `_lxFirstCategoryClick(idx)` + `_highlightTag(idx, sub_idx, false)`；每批数据返回后调用 `p.setList(0, 6, matched, "smoothRender.showList", true)` 渲染商品卡片并触发浏览器加载商品缩略图。
+3. **同时填充 `/api/rohr.js` 触摸轨迹（`mT`/`tT`）与 `H5guard` 生物探针（`bio/info/report`）**：
+   - 每次请求前在 `Runtime.evaluate` 内同时触发 `p._onTouchMove({touches: [...], changedTouches: [...]})`、`MouseEvent('mousemove'/'click')` 与 `Event('scroll')`。
+4. **自动清理验证回跳残留 URL 参数**：
+   - 自动通过 `history.replaceState` 与 `delete p.options[k]` 清除 `verify.meituan.com` 回跳残留的 `code=121044`、`request_code`、`response_code`。
 
 ---
 
