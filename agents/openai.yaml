@@ -1,0 +1,4 @@
+interface:
+  display_name: "美团闪购竞对全量采集与比价引擎 (meituanjingdui)"
+  short_description: "通过美团外卖H5端防风控高速采集竞对超市全量商品（含69条码、高清主图、标准类目、原价/折扣价/神价到手价、月售、实时库存及多规格明细）并生成竞对Excel与选品改价方案。"
+  default_prompt: "请使用 meituanjingdui 技能，引导我在美团H5端定位并进入目标竞对超市门店，在防418风控阈值下全量抓取该店商品数据并导出标准Excel竞对明细表。"
