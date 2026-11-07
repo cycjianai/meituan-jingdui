@@ -98,7 +98,9 @@ def parse_monthly_sales(saled_content, saled_num=0):
 def clean_pic_url(url):
     if not url:
         return ''
-    return re.sub(r'@watermark=.*$', '', str(url))
+    u = re.sub(r'@watermark=.*$', '', str(url))
+    u = re.sub(r'/\d+\.\d+\.\d+/', '/', u)
+    return u
 
 
 def extract_std_categories(spu):
@@ -214,18 +216,18 @@ def build_excel(spus_jsonl, cat_json, out_xlsx):
     header_font = Font(color='FFFFFF', bold=True)
     multi_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
 
-    # Single Worksheet ONLY: 全量商品竞对明细表 (包含所有规格逐行展开)
+    # Single Worksheet ONLY: 全量商品竞对明细表 (包含所有规格逐行展开，共28列)
     ws = wb.active
     ws.title = '全量商品竞对明细'
     headers = [
         'SPU_ID', 'SKU_ID', 'UPC条形码(69码)', '商品名称',
-        '规格类型', '子规格名称(spec)', '组合规格(combine_spec)',
+        '规格类型', '子规格名称(spec)',
         '店内一级分类', '店内二级分类', '店内分类排名',
         '美团一级类目', '美团二级类目', '美团三级类目名称',
         '月销量(数值)', '想买人数', '点赞数', '实时库存',
         '原价(元)', '直接折扣价(元)', '神价/到手价(元)', '到手价说明', '竞对有效基准价(元)',
-        '促销标签', '满减商品券', '限购份数', '最小起购数', '单位',
-        '售卖属性(温度/提示)', '卖点描述', '高清无水印主图URL', '子规格图片URL'
+        '促销标签', '满减商品券', '限购份数', '最小起购数',
+        '售卖属性(温度/提示)', '高清无水印主图URL', '子规格图片URL'
     ]
     ws.append(headers)
     for cell in ws[1]:
@@ -254,9 +256,7 @@ def build_excel(spus_jsonl, cat_json, out_xlsx):
         spu_promo_str = s.get('promotion_info') or ''
         coupon_tags = extract_coupon_tags(s)
         attrs_str = extract_attrs_str(s)
-        selling_desc = ' | '.join(s.get('selling_points') or []) or s.get('description', '')
         main_pic = clean_pic_url(s.get('picture'))
-        unit_str = s.get('unit') or ''
 
         for k in skus:
             k_orig = k.get('origin_price', s.get('min_price'))
@@ -274,7 +274,6 @@ def build_excel(spus_jsonl, cat_json, out_xlsx):
                 s.get('name', ''),
                 spec_type,
                 k.get('spec') or '',
-                k.get('combine_spec') or '',
                 s.get('_store_cat_name', ''),
                 s.get('_store_l2_name', ''),
                 s.get('_store_cat_rank', ''),
@@ -294,9 +293,7 @@ def build_excel(spus_jsonl, cat_json, out_xlsx):
                 coupon_tags,
                 k_rest,
                 k.get('min_order_count', 1),
-                unit_str,
                 attrs_str,
-                selling_desc,
                 main_pic,
                 sku_pic
             ]
@@ -308,7 +305,7 @@ def build_excel(spus_jsonl, cat_json, out_xlsx):
                 multi_sku_rows += 1
 
     wb.save(out_xlsx)
-    print(f"[Export Done] Single sheet '{ws.title}': {len(spus)} SPUs -> {total_sku_rows} SKU rows (单规格: {len(spus)-multi_spu_count}, 多规格: {multi_spu_count} SPUs / {multi_sku_rows} rows) saved to {out_xlsx}", flush=True)
+    print(f"[Export Done] Single sheet '{ws.title}' (28 cols): {len(spus)} SPUs -> {total_sku_rows} SKU rows (单规格: {len(spus)-multi_spu_count}, 多规格: {multi_spu_count} SPUs / {multi_sku_rows} rows) saved to {out_xlsx}", flush=True)
 
 
 def main():
