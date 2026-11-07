@@ -8,12 +8,14 @@
 2. **多规格子 SKU 一次性全量带出**：无需逐个点开“选规格”弹窗，`skus[]` 数组直接包含所有子规格的独立条码、原价、直接折扣价、实时库存与高清图。
 3. **穿透神价/券后到手价与实时库存**：直接提取 `unify_price.actual_price_info.actual_price`（神价到手价）、满减商品券（`dynamic_act_labels`）及对手当前真实库存（`real_stock`）。
 4. **高清无水印主图与官方三级类目**：自带原图 URL 与 `standardCategorys`（美团官方一/二/三级类目 ID 与名称），支持无码百货的视觉比对与按三级类目均衡选品。
-5. **防 418 拟人呼吸限速架构**：内置灵犀点击埋点（`_lxFirstCategoryClick`）、DOM 生物行为注入（`mousemove/click/scroll`）与 10/32 次三级滑动窗口冷却机制，单次批量拉取 50 个 SPU，15~18 分钟稳健抓完 8,000+ SKU 大店，支持一天连续采集多家门店。
+5. **防 418 拟人呼吸限速架构**：内置灵犀点击埋点（`_lxFirstCategoryClick`）、DOM 生物行为注入（`mousemove/click/scroll`）与滑动窗口冷却机制，单次批量拉取 30 个 SPU（包含全部多规格子 SKU 独立价格、库存、条码），支持一天连续采集多家门店。
+6. **两阶段按需建品组装能力**：日常比价走高速列表批量接口生成 **27 列单表全规格竞对明细**；当需要引进竞对热销新品时，直接调用 `scripts/fetch_spu_details.py`（底层 `productInfoV2`）按需拉取目标商品的**轮播副图（`pictures`）、图文详情长图（`pic_content.contents`）、结构化商品属性参数表（`standard_productinfo_list`）及子规格图**，并支持一键下载分类图片包。
 
 ## 目录结构
 
-- `SKILL.md`：Skill 核心指令、定位防错规范、防 418 压测准则与导出字段定义
-- `scripts/crawl_h5_store.py`：防 418 全店断点续传采集脚本
-- `scripts/export_competitor_excel.py`：全维度 Excel 竞对总表与子 SKU 拆解导出脚本
+- `SKILL.md`：Skill 核心指令、定位防错规范、防 418 压测准则、27 列单表字段定义与二阶段详情拉取规范
+- `scripts/crawl_h5_store.py`：阶段一防 418 全店批量列表断点续传采集脚本
+- `scripts/export_competitor_excel.py`：阶段一 27 列单表全规格 Excel 竞对明细导出脚本
+- `scripts/fetch_spu_details.py`：阶段二按需拉取单品轮播副图、详情长图、商品属性参数表与图片包脚本
 - `references/anti_418_protocol.md`：美团 H5 闪购风控机制与压测调优手册
 - `agents/openai.yaml`：Agent 平台元数据配置

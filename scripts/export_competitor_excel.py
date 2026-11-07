@@ -216,7 +216,7 @@ def build_excel(spus_jsonl, cat_json, out_xlsx):
     header_font = Font(color='FFFFFF', bold=True)
     multi_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
 
-    # Single Worksheet ONLY: 全量商品竞对明细表 (包含所有规格逐行展开，共28列)
+    # Single Worksheet ONLY: 全量商品竞对明细表 (包含所有规格逐行展开，共27列)
     ws = wb.active
     ws.title = '全量商品竞对明细'
     headers = [
@@ -227,7 +227,7 @@ def build_excel(spus_jsonl, cat_json, out_xlsx):
         '月销量(数值)', '想买人数', '点赞数', '实时库存',
         '原价(元)', '直接折扣价(元)', '神价/到手价(元)', '到手价说明', '竞对有效基准价(元)',
         '促销标签', '满减商品券', '限购份数', '最小起购数',
-        '售卖属性(温度/提示)', '高清无水印主图URL', '子规格图片URL'
+        '售卖属性(温度/提示)', '高清无水印主图URL'
     ]
     ws.append(headers)
     for cell in ws[1]:
@@ -265,7 +265,6 @@ def build_excel(spus_jsonl, cat_json, out_xlsx):
             k_promo = k.get('promotion_info') or spu_promo_str
             sku_actual_p = spu_actual_price if (spu_actual_price is not None and (not is_multi or k_disc == s.get('min_price'))) else ''
             k_eff = compute_effective_competitor_price(k_orig, k_disc, sku_actual_p if sku_actual_p != '' else None, k_promo, k_rest)
-            sku_pic = clean_pic_url(k.get('picture')) or main_pic
 
             row_data = [
                 str(s.get('id', '')),
@@ -294,8 +293,7 @@ def build_excel(spus_jsonl, cat_json, out_xlsx):
                 k_rest,
                 k.get('min_order_count', 1),
                 attrs_str,
-                main_pic,
-                sku_pic
+                main_pic
             ]
             ws.append(row_data)
             total_sku_rows += 1
@@ -305,7 +303,7 @@ def build_excel(spus_jsonl, cat_json, out_xlsx):
                 multi_sku_rows += 1
 
     wb.save(out_xlsx)
-    print(f"[Export Done] Single sheet '{ws.title}' (28 cols): {len(spus)} SPUs -> {total_sku_rows} SKU rows (单规格: {len(spus)-multi_spu_count}, 多规格: {multi_spu_count} SPUs / {multi_sku_rows} rows) saved to {out_xlsx}", flush=True)
+    print(f"[Export Done] Single sheet '{ws.title}' (27 cols): {len(spus)} SPUs -> {total_sku_rows} SKU rows (单规格: {len(spus)-multi_spu_count}, 多规格: {multi_spu_count} SPUs / {multi_sku_rows} rows) saved to {out_xlsx}", flush=True)
 
 
 def main():
