@@ -44,21 +44,22 @@ description: 美团闪购/超市便利竞对门店全量高维数据采集与比
 2. **缺少 DOM 生物行为探针数据（`bio/info/report`）**：
    - `msp.meituan.com/fingerprint/v1/notapp/bio/info/report` 持续监听页面内的 `mousemove`、`mousedown`、`mouseup`、`click`、`scroll` 事件；连续无交互请求会被判定为脚本。
    - **注意**：在 macOS 上不要使用 CDP `Input.dispatchMouseEvent(type="mouseWheel")`，当浏览器处于后台时会被 macOS 窗口合成器挂起导致超时；**必须在 `Runtime.evaluate` 内通过 `document.dispatchEvent(new MouseEvent(...))` 和 `window.dispatchEvent(new Event('scroll'))` 注入原生 DOM 事件**。
-3. **1 分钟滑动窗口请求频次上限（QPM 门禁）**：
-   - 单店连续请求速率若超过 `~22 次/分钟` 或连续突发满 `55 次` 无停顿，网关会返回 `418`。
+3. **2 分钟滑动窗口请求频次上限（~28–30 次请求门禁）与 `smoothRender` 30品批次约束**：
+   - 进店首屏自带约 4~5 次底层请求，此后连续请求（即使穿插 10 秒短停顿）累计达到第 **29~30 次**时会触发滑动窗口门禁返回 `418`。
+   - 同时，`/quickbuy/v1/poi/product/smooth/render` 服务端硬上限为 **单次返回 30 个 SPU**（虽然前端 JS 写 `slice(0, 50)`，但服务端只返回前 30 个）。必须按 **30 个 SPU/批** 动态取未采集差集 `missing_ids[:30]`，绝不能按 50 步进导致漏采和 ID 跳跃异常。
 
-### 3.2 极速且零封控的标准采集架构（单店 8,000+ SKU 约 15~18 分钟，支持一天连爬多店）
+### 3.2 极速且零封控的标准采集架构（支持一天稳定连爬多家门店）
 1. **分类遍历顺序优化（先爬实体分类 `idx >= 7`，最后补齐活动分类 `0..6`）**：
    - 门店前 7 个分类通常为 `推荐`、`神价`、`活动`、`疯狂折扣` 等聚合活动区（99% 商品与实体分类重复）。
    - **先遍历 `idx >= 7` 的实体一级分类**：既能确保每个商品落入真实的店内一级分类（如 `饮料专区`、`生活用水`、`五金家装`），又能在最后扫描活动分类时通过全局 `seen_spus` 自动跳过已抓商品，减少约 25% 冗余请求。
-2. **单分类“全部”视图一次拿齐 ID + 50 品/批满载拉取**：
+2. **单分类“全部”视图一次拿齐 ID + 30 品/批动态差集拉取**：
    - 对每个一级分类 `idx`，取其 `全部` 子标签（`sub_idx = 0 if p._ifHasSubTag(idx) else -1`），调用 1 次 `requestSpusAndSortedIds` 即可拿到该一级分类下**全部子分类的 100% 排序商品 ID（`allSortedSpuId`）**及前 20 个商品详情，无需逐个点击二级子分类。
-   - 对该分类剩余未采集的 `allSortedSpuId`，按服务端最大上限 **50 个 SPU/批** 调用 `p.requestSmoothSpus(batchOf50, idx, sub_idx, c.tag, c.type, c.extra, true)`。
-3. **自适应呼吸限速（Adaptive Pacing）**：
-   - 每次请求前注入 6 步 DOM 鼠标轨迹与滚动事件，基础间隔 `2.8 ~ 4.2 秒`；
-   - 每满 **10 次请求** 小憩 `8 ~ 12 秒`；
-   - 每满 **32 次请求**（远低于 55 次触发阈值）执行一次 `22 ~ 28 秒` 的滑动窗口清零休息；
-   - 全程增量写入 `*.jsonl` 断点文件，若偶发滑块验证（`verify.meituan.com`），自动暂停等待验证通过后从当前批次无缝续传。
+   - 对该分类剩余未采集的 `allSortedSpuId`，动态计算 `missing_ids = [x for x in all_ids if x not in seen_spus]`，每次取前 **30 个 SPU** 调用 `p.requestSmoothSpus(batchOf30, idx, sub_idx, c.tag, c.type, c.extra, true)`，确保 100% 连续无遗漏。
+3. **自适应呼吸限速（20 请求滑动窗口清零机制）**：
+   - 每次请求前注入 6 步 DOM 鼠标轨迹与滚动事件，基础间隔 `3.5 ~ 5.2 秒`；
+   - 每满 **8 次请求** 小憩 `9 ~ 13 秒`；
+   - 第 **18 次请求**及此后每满 **20 次请求**（远低于 29~30 次触发阈值）执行一次 `38 ~ 48 秒` 的滑动窗口清零休息；
+   - 全程增量写入 `*.jsonl` 断点文件，若偶发点选/滑块验证（`verify.meituan.com`），自动暂停等待验证通过后从当前批次无缝续传。
 
 ---
 

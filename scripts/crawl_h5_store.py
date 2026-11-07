@@ -84,6 +84,7 @@ async def simulate_human_interaction(ws, msg_seq, is_category_switch=False):
 
 async def wait_until_store_ready(ws, msg_seq, expected_poi_id_str=None):
     """Ensure tab is on the target store page and not on verify.meituan.com."""
+    logged_wait = False
     while True:
         msg_seq += 1
         try:
@@ -107,27 +108,36 @@ async def wait_until_store_ready(ws, msg_seq, expected_poi_id_str=None):
             and 'verify.meituan.com' not in state.get('url', '')
             and (not expected_poi_id_str or state.get('poiIdStr') == expected_poi_id_str)
         ):
+            if logged_wait:
+                print(f"[RESUMED] Store page ready again: {state.get('poiName')} ({state.get('poiIdStr')})", flush=True)
             return msg_seq, state
 
-        print(f"[WAIT_READY] State={state}, waiting 3s...", flush=True)
+        if not logged_wait:
+            print(f"[WAIT_READY] Waiting for store page / verification completion (url={state.get('url', '')[:80]}...)", flush=True)
+            logged_wait = True
         await asyncio.sleep(3.0)
 
 
 async def adaptive_sleep(ws, msg_seq, req_counter, is_category_switch=False):
-    """Human-paced adaptive sleep with periodic sliding-window cooldowns to prevent HTTP 418."""
+    """
+    Pressure-tested Anti-418 pacing:
+    - Meituan wx-shangou triggers HTTP 418 at ~28-30 requests in a 2-minute sliding window (including ~4-5 initial page load requests).
+    - Therefore we pause 38~48s every 20 requests (and at request #18 on first burst) to completely reset the sliding window,
+      plus a 9~13s breather every 8 requests and 3.5~5.2s base delay per request.
+    """
     msg_seq = await simulate_human_interaction(ws, msg_seq, is_category_switch=is_category_switch)
-    base_delay = random.uniform(2.8, 4.2)
+    base_delay = random.uniform(3.5, 5.2)
     await asyncio.sleep(base_delay)
 
-    if req_counter > 0 and req_counter % 32 == 0:
-        cooldown = random.uniform(22.0, 28.0)
-        print(f"  [Anti-418 Cooldown] Reached {req_counter} requests, resting {cooldown:.1f}s to reset sliding window...", flush=True)
+    if req_counter > 0 and (req_counter == 18 or (req_counter > 18 and (req_counter - 18) % 20 == 0)):
+        cooldown = random.uniform(38.0, 48.0)
+        print(f"  [Anti-418 Window Reset] Reached {req_counter} requests, resting {cooldown:.1f}s to clear Meituan sliding window...", flush=True)
         half = cooldown / 2.0
         await asyncio.sleep(half)
         msg_seq = await simulate_human_interaction(ws, msg_seq, is_category_switch=False)
         await asyncio.sleep(half)
-    elif req_counter > 0 and req_counter % 10 == 0:
-        pause = random.uniform(8.0, 12.0)
+    elif req_counter > 0 and req_counter % 8 == 0:
+        pause = random.uniform(9.0, 13.0)
         print(f"  [Breather] {req_counter} requests, pausing {pause:.1f}s...", flush=True)
         await asyncio.sleep(pause)
 
@@ -158,7 +168,7 @@ async def run_crawler(args):
             except Exception:
                 pass
 
-    target = next((t for t in tabs if 'cactivityapi-sc.waimai.meituan.com' in t.get('url', '') or 'waimai.meituan.com' in t.get('url', '')), None)
+    target = next((t for t in tabs if 'cactivityapi-sc.waimai.meituan.com' in t.get('url', '') or 'waimai.meituan.com' in t.get('url', '') or 'verify.meituan.com' in t.get('url', '')), None)
     if not target:
         raise RuntimeError("Could not find open Meituan H5 store tab in Chrome!")
 
@@ -202,6 +212,7 @@ async def run_crawler(args):
         print(f"[Store Verified] {poi_info.get('name')} ({meta.get('poi_id_str')}), L1 categories: {len(menu_tabs)}, existing SPUs: {len(seen_spus)}", flush=True)
 
         out_f = open(spus_jsonl, 'a', encoding='utf-8')
+        unfetchable_ids = set()
 
         def record_spus(spus_list, l1_idx, l1_name, l1_tag):
             added = 0
@@ -312,16 +323,16 @@ async def run_crawler(args):
                         json.dump(cat_map, cf, ensure_ascii=False, indent=2)
                     print(f"[{step_num}/{len(ordered_tabs)}] Cat[{idx}] {name}: {len(all_ids)} total IDs, +{added} initial SPUs (unique={len(seen_spus)})", flush=True)
 
+            # Fetch remaining unfetched SPU IDs in exact server-capped batches of 30
             cinfo = cat_map.get(str_idx) or {}
             all_ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
-            missing_ids = [x for x in all_ids if x not in seen_spus]
-
-            b_start = 0
-            while b_start < len(missing_ids):
-                batch = [x for x in missing_ids[b_start:b_start+50] if x not in seen_spus]
-                if not batch:
-                    b_start += 50
-                    continue
+            batch_idx = 0
+            while True:
+                missing_ids = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
+                if not missing_ids:
+                    break
+                batch = missing_ids[:30]
+                batch_idx += 1
 
                 req_counter += 1
                 msg_seq = await adaptive_sleep(ws, msg_seq, req_counter, is_category_switch=False)
@@ -347,15 +358,20 @@ async def run_crawler(args):
                 ''')
 
                 if res and res.get('error'):
-                    print(f"  [WARN] Cat[{idx}] {name} batch {b_start} error: {res['error']}", flush=True)
+                    print(f"  [WARN] Cat[{idx}] {name} batch {batch_idx} error: {res['error']}", flush=True)
                     await asyncio.sleep(5.0)
                     msg_seq, _ = await wait_until_store_ready(ws, msg_seq, actual_poi_id)
                     continue
 
                 spus = (res or {}).get('spus') or []
+                returned_ids = {int(s['id']) for s in spus if isinstance(s, dict) and s.get('id')}
+                for bid in batch:
+                    if bid not in returned_ids:
+                        unfetchable_ids.add(bid)
+
                 added = record_spus(spus, idx, name, tag)
-                print(f"  -> Cat[{idx}] {name} batch {b_start//50 + 1}/{(len(missing_ids)+49)//50}: +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
-                b_start += 50
+                rem_after = len([x for x in all_ids if x not in seen_spus and x not in unfetchable_ids])
+                print(f"  -> Cat[{idx}] {name} batch {batch_idx} (rem={rem_after}): +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
 
             with open(progress_json, 'w', encoding='utf-8') as pf:
                 json.dump({
