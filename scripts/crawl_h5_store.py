@@ -401,10 +401,61 @@ async def run_crawler(args):
                         json.dump(cat_map, cf, ensure_ascii=False, indent=2)
                     print(f"[{step_num}/{len(ordered_tabs)}] Cat[{idx}] {name}: {len(all_ids)} total IDs, +{added} initial SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
 
-            # Fetch remaining unfetched SPU IDs: send slice of up to 50 IDs (matching genuine smooth-render.js),
-            # while server returns first 30.
+            # Step B: Dual-Endpoint Load Balancing (spuTagProducts on L2 sub-tags + smoothRender on remaining IDs)
+            # Meituan rate-limits `/quickbuy/v1/poi/sputag/products` and `/quickbuy/v1/poi/product/smooth/render`
+            # on SEPARATE per-endpoint counters (~100 reqs/hour each).
+            # Splitting load across both endpoints doubles hourly SPU throughput while keeping each endpoint <50 reqs/hour.
             cinfo = cat_map.get(str_idx) or {}
             all_ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
+            sub_tags_list = m.get('sub_tags') or []
+
+            missing_now = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
+            if len(missing_now) > 35 and len(sub_tags_list) > 2:
+                for st_idx, st_info in enumerate(sub_tags_list):
+                    if st_idx == 0 or st_info.get('name') == '全部':
+                        continue
+                    missing_now = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
+                    if len(missing_now) <= 20:
+                        break
+                    req_counter += 1
+                    msg_seq = await adaptive_sleep(ws, msg_seq, req_counter, is_category_switch=True)
+                    msg_seq, _ = await wait_until_store_ready(ws, msg_seq, actual_poi_id)
+
+                    msg_seq += 1
+                    sub_res = await eval_js(ws, msg_seq, f'''
+                    (async () => {{
+                        const p = getCurrentPages()[0];
+                        const c = p._getCachedData({idx}, {st_idx});
+                        try {{
+                            if (typeof p._highlightTag === 'function') {{
+                                p._highlightTag({idx}, {st_idx}, false);
+                            }}
+                            await p.requestSpusAndSortedIds({idx}, {st_idx}, c.tag, c.type, 0, true);
+                        }} catch (err) {{
+                            return {{error: String(err.message || err)}};
+                        }}
+                        const c2 = p._getCachedData({idx}, {st_idx});
+                        try {{
+                            if (c2.spus && c2.spus.length > 0 && typeof p.setList === 'function') {{
+                                const renderObj = p.setList(0, Math.min(6, c2.spus.length), c2.spus, "smoothRender.showList", true);
+                                p.setData(renderObj);
+                            }}
+                        }} catch (e) {{}}
+                        return {{spus: c2.spus || []}};
+                    }})()
+                    ''')
+                    if sub_res and sub_res.get('error'):
+                        err_msg = str(sub_res['error'])
+                        print(f"  [CIRCUIT_BREAKER] SubCat[{idx}:{st_idx}] {st_info.get('name')} error: {err_msg}", flush=True)
+                        out_f.flush()
+                        if '403' in err_msg or '406' in err_msg or '418' in err_msg:
+                            sys.exit(43)
+                        break
+                    sub_spus = (sub_res or {}).get('spus') or []
+                    added_sub = record_spus(sub_spus, idx, name, tag)
+                    rem_after_sub = len([x for x in all_ids if x not in seen_spus and x not in unfetchable_ids])
+                    print(f"  -> SubCat[{idx}:{st_idx}] {st_info.get('name')} (spuTagProducts, rem={rem_after_sub}): +{added_sub} SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
+
             batch_idx = 0
             while True:
                 missing_ids = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
