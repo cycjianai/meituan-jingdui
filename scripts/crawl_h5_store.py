@@ -196,6 +196,7 @@ async def run_crawler(args):
         meta = await eval_js(ws, msg_seq, '''
         (() => {
             const p = getCurrentPages()[0];
+            const rawTags = (p.store && p.store.getState && p.store.getState().poi && p.store.getState().poi.food_spu_tags) || [];
             return {
                 poi_id_str: p.data.poi_id_str,
                 poiInfo: p.data.poiInfo,
@@ -204,7 +205,11 @@ async def run_crawler(args):
                     name: m.name,
                     tag: m.tag,
                     type: m.type,
-                    hasSub: p._ifHasSubTag(idx)
+                    hasSub: p._ifHasSubTag(idx),
+                    sub_tags: ((rawTags[idx] && rawTags[idx].tags) || []).map(st => ({
+                        tag: st.tag,
+                        name: st.name
+                    }))
                 }))
             };
         })()
@@ -319,6 +324,7 @@ async def run_crawler(args):
                         'tag': (res or {}).get('tag', tag),
                         'type': (res or {}).get('type', 1),
                         'sub_idx': sub_idx,
+                        'sub_tags': m.get('sub_tags', []),
                         'allSortedSpuId': all_ids
                     }
                     with open(cat_map_json, 'w', encoding='utf-8') as cf:
