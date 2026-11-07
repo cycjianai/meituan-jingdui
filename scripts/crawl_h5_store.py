@@ -120,24 +120,26 @@ async def wait_until_store_ready(ws, msg_seq, expected_poi_id_str=None):
 
 async def adaptive_sleep(ws, msg_seq, req_counter, is_category_switch=False):
     """
-    Pressure-tested Anti-418 pacing:
-    - Meituan wx-shangou triggers HTTP 418 at ~28-30 requests in a 2-minute sliding window (including ~4-5 initial page load requests).
-    - Therefore we pause 38~48s every 20 requests (and at request #18 on first burst) to completely reset the sliding window,
-      plus a 9~13s breather every 8 requests and 3.5~5.2s base delay per request.
+    Rolling-120s-Window Anti-418 Pacing:
+    - Meituan's gateway enforces a strict 120-second rolling window cap of ~24 requests.
+    - By spacing requests at 5.2~7.2s, pausing 14~20s every 6 requests, and resting 65~75s every 15 requests,
+      any 120-second rolling window contains at most 14~15 requests, permanently staying below the 418 threshold.
     """
     msg_seq = await simulate_human_interaction(ws, msg_seq, is_category_switch=is_category_switch)
-    base_delay = random.uniform(3.5, 5.2)
+    base_delay = random.uniform(5.2, 7.2)
     await asyncio.sleep(base_delay)
 
-    if req_counter > 0 and (req_counter == 18 or (req_counter > 18 and (req_counter - 18) % 20 == 0)):
-        cooldown = random.uniform(38.0, 48.0)
-        print(f"  [Anti-418 Window Reset] Reached {req_counter} requests, resting {cooldown:.1f}s to clear Meituan sliding window...", flush=True)
-        half = cooldown / 2.0
-        await asyncio.sleep(half)
+    if req_counter > 0 and req_counter % 15 == 0:
+        cooldown = random.uniform(65.0, 75.0)
+        print(f"  [Anti-418 Rolling-Window Reset] Reached {req_counter} requests, resting {cooldown:.1f}s so 120s window ages out...", flush=True)
+        third = cooldown / 3.0
+        await asyncio.sleep(third)
         msg_seq = await simulate_human_interaction(ws, msg_seq, is_category_switch=False)
-        await asyncio.sleep(half)
-    elif req_counter > 0 and req_counter % 8 == 0:
-        pause = random.uniform(9.0, 13.0)
+        await asyncio.sleep(third)
+        msg_seq = await simulate_human_interaction(ws, msg_seq, is_category_switch=False)
+        await asyncio.sleep(third)
+    elif req_counter > 0 and req_counter % 6 == 0:
+        pause = random.uniform(14.0, 20.0)
         print(f"  [Breather] {req_counter} requests, pausing {pause:.1f}s...", flush=True)
         await asyncio.sleep(pause)
 
