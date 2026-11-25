@@ -27,6 +27,7 @@ Empirically Proven Architecture (Validated on 8,867-SPU / 11,848-SKU Supermarket
 """
 import argparse
 import asyncio
+import datetime
 import json
 import os
 import random
@@ -303,14 +304,19 @@ def save_timestamps(ts_json):
         json.dump(data, f)
 
 
-async def adaptive_sleep(ws, msg_seq, req_counter, ts_json, endpoint='sputag_p0', is_category_switch=False, export_cb=None):
+async def adaptive_sleep(
+    ws, msg_seq, req_counter, ts_json,
+    endpoint='sputag_p0', is_category_switch=False, export_cb=None,
+    min_delay=58.0, max_delay=76.0, hourly_cap=55, wave_size=0, wave_rest_sec=0.0
+):
     """
     Empirically Proven Zero-418 / Zero-403 Pacing Model:
     - Applies to `sputag_p0` (native `page_index=0` clicks) and `smooth` (`requestSmoothSpus(batch=30)`):
-      58~76s interval (~50-53 reqs/hour, <= 2-3 reqs per 125s window, <= 55 reqs/62m per endpoint,
-      <= 58 total reqs/62m). Validated across 43 consecutive calls with 0 sliders (418) and 0 blocks (403).
+      Default 58~76s interval (~50-53 reqs/hour, <= 2-3 reqs per 125s window).
+      Supports ultra-conservative single-account overrides via CLI (--min-delay, --max-delay,
+      --hourly-cap, --wave-size, --wave-rest-sec).
     """
-    total_wait = random.uniform(58.0, 76.0)
+    total_wait = random.uniform(min_delay, max_delay)
     chunks = 2
     for _ in range(chunks):
         await asyncio.sleep(total_wait / chunks)
@@ -319,8 +325,19 @@ async def adaptive_sleep(ws, msg_seq, req_counter, ts_json, endpoint='sputag_p0'
     if export_cb and req_counter > 0 and req_counter % 3 == 0:
         export_cb()
 
+    if wave_size > 0 and wave_rest_sec > 0 and req_counter > 1 and (req_counter - 1) % wave_size == 0:
+        rest_s = random.uniform(wave_rest_sec * 0.9, wave_rest_sec * 1.15)
+        if export_cb:
+            export_cb()
+        print(f"  [Wave Rest] Completed {req_counter - 1} requests -> deep natural rest {rest_s/60:.1f} mins to protect single-account quota...", flush=True)
+        w_chunks = max(2, int(rest_s // 90))
+        for _ in range(w_chunks):
+            await asyncio.sleep(rest_s / w_chunks)
+            msg_seq = await simulate_human_interaction(ws, msg_seq, is_category_switch=False)
+
     ep_list = SPUTAG_TIMESTAMPS if endpoint == 'sputag_p0' else SMOOTH_TIMESTAMPS
-    ep_cap = 55
+    ep_cap = min(55, int(hourly_cap))
+    total_cap = min(58, max(ep_cap, int(hourly_cap) + 3))
     while True:
         now = time.time()
         in_2m = [t for t in REQ_TIMESTAMPS if now - t < 125.0]
@@ -344,12 +361,12 @@ async def adaptive_sleep(ws, msg_seq, req_counter, ts_json, endpoint='sputag_p0'
                     await asyncio.sleep(chunk)
                     msg_seq = await simulate_human_interaction(ws, msg_seq, is_category_switch=False)
                 continue
-        if len(in_62m_total) >= 58:
+        if len(in_62m_total) >= total_cap:
             wait_tot = 3725.0 - (now - in_62m_total[0]) + random.uniform(20.0, 40.0)
             if wait_tot > 0:
                 if export_cb:
                     export_cb()
-                print(f"  [60m Total Guard] {len(in_62m_total)} total reqs in last 62m (cap 58), resting {wait_tot/60:.1f} mins...", flush=True)
+                print(f"  [60m Total Guard] {len(in_62m_total)} total reqs in last 62m (cap {total_cap}), resting {wait_tot/60:.1f} mins...", flush=True)
                 chunks = max(1, int(wait_tot // 90))
                 chunk = wait_tot / chunks
                 for _ in range(chunks):
@@ -437,6 +454,36 @@ async def run_crawler(args):
     cat_map_json = os.path.join(args.out_dir, 'categories.json')
     ts_json = os.path.join(args.out_dir, 'timestamps.json')
     progress_json = os.path.join(args.out_dir, 'progress.json')
+    daily_quota_json = os.path.join(args.out_dir, 'daily_quota.json')
+
+    def load_daily_quota():
+        if os.path.exists(daily_quota_json):
+            try:
+                return json.load(open(daily_quota_json, 'r', encoding='utf-8'))
+            except Exception:
+                pass
+        return {}
+
+    daily_quota = load_daily_quota()
+
+    def today_key():
+        return datetime.date.today().isoformat()
+
+    def get_daily_count(ep):
+        return int((daily_quota.get(today_key()) or {}).get(ep, 0))
+
+    def inc_daily_count(ep):
+        tk = today_key()
+        daily_quota.setdefault(tk, {'sputag': 0, 'smooth': 0})
+        daily_quota[tk][ep] = int(daily_quota[tk].get(ep, 0)) + 1
+        with open(daily_quota_json, 'w', encoding='utf-8') as df:
+            json.dump(daily_quota, df, ensure_ascii=False, indent=2)
+
+    print(
+        f"[Daily Quota] {today_key()}: sputag={get_daily_count('sputag')}/{args.max_sputag_daily}, "
+        f"smooth={get_daily_count('smooth')}/{args.max_smooth_daily}",
+        flush=True
+    )
 
     load_timestamps(ts_json)
     seen_spus = load_existing_spus(spus_jsonl)
@@ -592,6 +639,19 @@ async def run_crawler(args):
         ordered_tabs = entity_tabs + promo_tabs
         print(f"[Plan] Crawling {len(entity_tabs)} entity categories first, then {len(promo_tabs)} promo/virtual categories.", flush=True)
 
+        pacing_kw = dict(
+            min_delay=args.min_delay,
+            max_delay=args.max_delay,
+            hourly_cap=args.hourly_cap,
+            wave_size=args.wave_size,
+            wave_rest_sec=args.wave_rest_sec,
+        )
+        print(
+            f"[Pacing] delay={args.min_delay:.0f}~{args.max_delay:.0f}s, hourly_cap={args.hourly_cap}, "
+            f"wave_size={args.wave_size}, wave_rest={args.wave_rest_sec/60:.1f}m",
+            flush=True
+        )
+
         # PASS 1: Fetch L1 page_index=0 for every category (`allSortedSpuId` + initial 20 SPUs)
         for step_num, m in enumerate(ordered_tabs, 1):
             idx = m['idx']
@@ -615,10 +675,53 @@ async def run_crawler(args):
                         json.dump(cat_map, cf, ensure_ascii=False, indent=2)
                 continue
 
+            # Check if already populated in page Redux memory (e.g. initial landing tab) to save quota
+            msg_seq += 1
+            mem_cat = await eval_js(ws, msg_seq, f'''
+            (() => {{
+                const p = getCurrentPages()[0];
+                const c = p._getCachedData({idx}, {sub_idx});
+                return {{
+                    tag: c && c.tag,
+                    type: c && c.type,
+                    allSortedSpuId: (c && c.allSortedSpuId) || [],
+                    spus: (c && c.spus) || []
+                }};
+            }})()
+            ''')
+            if mem_cat and len(mem_cat.get('allSortedSpuId') or []) > 0:
+                added_mem = record_spus(mem_cat.get('spus'), idx, name, tag)
+                cat_map[str_idx] = {
+                    'idx': idx,
+                    'name': name,
+                    'tag': mem_cat.get('tag') or tag,
+                    'type': mem_cat.get('type') or 1,
+                    'is_promo': is_promo,
+                    'sub_idx': sub_idx,
+                    'sub_tags': m.get('sub_tags', []),
+                    'allSortedSpuId': mem_cat['allSortedSpuId']
+                }
+                with open(cat_map_json, 'w', encoding='utf-8') as cf:
+                    json.dump(cat_map, cf, ensure_ascii=False, indent=2)
+                save_progress('Pass1_L1_mem', step_num, len(ordered_tabs), idx, name)
+                print(f"[Pass1 {step_num}/{len(ordered_tabs)}] Cat[{idx}] {name}: {len(mem_cat['allSortedSpuId'])} IDs loaded from memory (+{added_mem} SPUs, 0 reqs!)", flush=True)
+                continue
+
             while True:
+                if args.max_sputag_daily > 0 and get_daily_count('sputag') >= args.max_sputag_daily:
+                    print(
+                        f"[DAILY_QUOTA_GUARD] spuTagProducts reached safe daily soft cap ({get_daily_count('sputag')}/{args.max_sputag_daily}) -> "
+                        "pausing cleanly BEFORE 403 so this account remains 100% healthy & unbanned!",
+                        flush=True
+                    )
+                    out_f.flush()
+                    export_current_excel()
+                    out_f.close()
+                    sys.exit(44)
                 req_counter += 1
-                msg_seq = await adaptive_sleep(ws, msg_seq, req_counter, ts_json, endpoint='sputag_p0', is_category_switch=True, export_cb=export_current_excel)
+                msg_seq = await adaptive_sleep(ws, msg_seq, req_counter, ts_json, endpoint='sputag_p0', is_category_switch=True, export_cb=export_current_excel, **pacing_kw)
                 msg_seq, _ = await wait_until_store_ready(ws, msg_seq, actual_poi_id, args.poi_name)
+                inc_daily_count('sputag')
 
                 msg_seq += 1
                 res = await eval_js(ws, msg_seq, f'''
@@ -687,6 +790,13 @@ async def run_crawler(args):
 
         # PASS 1.5: High-efficiency `requestSmoothSpus(batch=30)` with seeded `c.allSortedSpuId` (30 SPUs per call)
         smooth_banned = False
+        if args.max_smooth_daily > 0 and get_daily_count('smooth') >= args.max_smooth_daily:
+            print(
+                f"[DAILY_QUOTA_GUARD] smoothRender already at safe daily soft cap ({get_daily_count('smooth')}/{args.max_smooth_daily}) -> "
+                "skipping Pass 1.5 today and switching to Pass 2 (L2 p=0)!",
+                flush=True
+            )
+            smooth_banned = True
         for step_num, m in enumerate(ordered_tabs, 1):
             if smooth_banned:
                 break
@@ -703,13 +813,22 @@ async def run_crawler(args):
                 continue
 
             while not smooth_banned:
+                if args.max_smooth_daily > 0 and get_daily_count('smooth') >= args.max_smooth_daily:
+                    print(
+                        f"  [DAILY_QUOTA_GUARD] smoothRender reached safe daily soft cap ({get_daily_count('smooth')}/{args.max_smooth_daily}) -> "
+                        "stopping smoothRender BEFORE 403 and switching to Pass 2 (L2 p=0)!",
+                        flush=True
+                    )
+                    smooth_banned = True
+                    break
                 missing_ids = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
                 if not missing_ids:
                     break
                 batch = [str(x) for x in missing_ids[:30]]
                 req_counter += 1
-                msg_seq = await adaptive_sleep(ws, msg_seq, req_counter, ts_json, endpoint='smooth', is_category_switch=False, export_cb=export_current_excel)
+                msg_seq = await adaptive_sleep(ws, msg_seq, req_counter, ts_json, endpoint='smooth', is_category_switch=False, export_cb=export_current_excel, **pacing_kw)
                 msg_seq, _ = await wait_until_store_ready(ws, msg_seq, actual_poi_id, args.poi_name)
+                inc_daily_count('smooth')
 
                 msg_seq += 1
                 res = await eval_js(ws, msg_seq, f'''
@@ -767,7 +886,20 @@ async def run_crawler(args):
         export_current_excel()
 
         # PASS 2: Safe fallback — L2 sub-category clicks at `page_index=0` (NEVER uses page_index >= 1)
-        for step_num, m in enumerate(ordered_tabs, 1):
+        # Prioritize highest-yield categories (highest missing SPUs per remaining L2 sub-tag) and skip tiny leftovers (<20)
+        pass2_candidates = []
+        for m in ordered_tabs:
+            str_idx = str(m['idx'])
+            cinfo = cat_map.get(str_idx) or {}
+            all_ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
+            missing_ids = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
+            sub_tags_list = cinfo.get('sub_tags') or m.get('sub_tags') or []
+            sub_left = sum(1 for s_i, st in enumerate(sub_tags_list) if s_i > 0 and st.get('name') != '全部' and not st.get('allSortedSpuId'))
+            if len(missing_ids) >= 20 and sub_left > 0:
+                pass2_candidates.append((len(missing_ids) / sub_left, len(missing_ids), m))
+        pass2_candidates.sort(key=lambda item: (-item[0], -item[1]))
+
+        for step_num, (_, _, m) in enumerate(pass2_candidates, 1):
             idx = m['idx']
             name = m['name']
             tag = m['tag']
@@ -779,7 +911,7 @@ async def run_crawler(args):
                 continue
 
             missing_ids = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
-            if not missing_ids:
+            if len(missing_ids) < 20:
                 continue
 
             sub_tags_list = cinfo.get('sub_tags') or m.get('sub_tags') or []
@@ -790,10 +922,21 @@ async def run_crawler(args):
                 missing_ids = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
                 if not missing_ids:
                     break
+                if args.max_sputag_daily > 0 and get_daily_count('sputag') >= args.max_sputag_daily:
+                    print(
+                        f"[DAILY_QUOTA_GUARD] spuTagProducts reached safe daily soft cap ({get_daily_count('sputag')}/{args.max_sputag_daily}) -> "
+                        "pausing cleanly BEFORE 403! Account remains 100% healthy & logged in for seamless next-day resume.",
+                        flush=True
+                    )
+                    out_f.flush()
+                    export_current_excel()
+                    out_f.close()
+                    sys.exit(44)
                 st_name = st.get('name', '')
                 req_counter += 1
-                msg_seq = await adaptive_sleep(ws, msg_seq, req_counter, ts_json, endpoint='sputag_p0', is_category_switch=True, export_cb=export_current_excel)
+                msg_seq = await adaptive_sleep(ws, msg_seq, req_counter, ts_json, endpoint='sputag_p0', is_category_switch=True, export_cb=export_current_excel, **pacing_kw)
                 msg_seq, _ = await wait_until_store_ready(ws, msg_seq, actual_poi_id, args.poi_name)
+                inc_daily_count('sputag')
 
                 msg_seq += 1
                 res = await eval_js(ws, msg_seq, f'''
@@ -874,6 +1017,13 @@ def main():
     parser.add_argument('--out-dir', type=str, default=None, help='Output directory for spus.jsonl, categories.json, timestamps.json')
     parser.add_argument('--excel-out-dir', type=str, default=None, help='Directory for exported {MMDD}{店铺名称}.xlsx (defaults to --out-dir)')
     parser.add_argument('--no-clean-on-403', action='store_true', help='Do not auto-run prepare_clean_login.py when 403 occurs')
+    parser.add_argument('--min-delay', type=float, default=58.0, help='Minimum delay between requests in seconds (default: 58)')
+    parser.add_argument('--max-delay', type=float, default=76.0, help='Maximum delay between requests in seconds (default: 76)')
+    parser.add_argument('--hourly-cap', type=int, default=55, help='Max requests per 62-minute window per endpoint (default: 55)')
+    parser.add_argument('--wave-size', type=int, default=0, help='Optional deep-rest wave size (0 = disabled)')
+    parser.add_argument('--wave-rest-sec', type=float, default=0.0, help='Optional deep-rest duration in seconds after each wave')
+    parser.add_argument('--max-sputag-daily', type=int, default=92, help='Safe daily soft cap for spuTagProducts(p=0) to stay well below ~112 403 cliff (default: 92, 0=disable)')
+    parser.add_argument('--max-smooth-daily', type=int, default=85, help='Safe daily soft cap for requestSmoothSpus(batch=30) to stay below 90 403 cliff (default: 85, 0=disable)')
     args = parser.parse_args()
     asyncio.run(run_crawler(args))
 

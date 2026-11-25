@@ -27,15 +27,20 @@
 | **账号 3（极慢速对比）** | **`spuTagProducts(page_index >= 1)`** | **~230s（慢了 6 倍！）** | **第 51 次** | `+953` SPU | **哪怕慢到 16 次/小时，依然每 ~18 次必弹 `418`（第 14、33、51 次），第 51 次依然 `403` 锁号！** |
 | **账号 1 次日解封收尾** | 仅 **`spuTagProducts(p=0)`**（L1/L2 首页） | `58~76s` | **112 次** | `+1,170` SPU | **全程 0 次 `418` 滑块**，满 112 次触及单号日度配额返回 `403` 熔断 |
 | **账号 2 次日解封收尾** | **`requestSmoothSpus(batch=30)`**（预注入 `c.allSortedSpuId`） | `58~76s` | **43 次** | **`+1,186` SPU（100% 完工）** | **全程 0 次 `418` 滑块、0 次 `403`、账号完好存活！** |
+| **林芝吉友超市实证（1 号）** | `47` 次 L1 `p=0` + **`90` 次 `smoothRender(30)`** + `45` 次 L2 `p=0` | `68~88s` + 每 30 次休 10 分 | `smooth` **第 91 次 403**；`sputag` 软锁停在 `92` | **`3,864` SPU** | **0 次 `418` 滑块！** 精准证实 `smoothRender` 单号日配额为 **`90` 次**（静默 2h4m 后仍 403，确为日度配额）；`sputag` 在 92 优雅停机，整号未封！ |
+| **林芝吉友超市收官（2 号）** | **`requestSmoothSpus(batch=30)`**（`account_pool.py` 切号） | `62~78s` + 30 次休 5 分 | **35 次** | **`+758` SPU（`4,622` 100% 完工）** | **0 次 `418` 滑块、0 次 `403`**，收官后 2 号当日仍余 `+50` 次 `smooth` 与 `+92` 次 `sputag` 额度！ |
 
 ### 核心铁律结论
 1. **为什么 `spuTagProducts(page_index >= 1)` 必死？**
    - 美团 H5 正常用户在手机上翻页 100% 走 `smooth/render`，绝不调 `spuTagProducts(page_index >= 1)`。美团网关对 `page_index >= 1` 设的是**与速度无关的硬次数熔断（累计 ~50 次 / 3 次 418 必封 403）**。本 Skill 已彻底删除该调用路径。
-2. **单账号 `spuTagProducts(p=0)` 日度硬上限约为 112 次**：
-   - 触及后返回 `openresty` 网关 `403`（带 `X-Forbid-Code`），属于 **12~24 小时/次日恢复的日度封禁**，**绝不是 1 小时恢复**。
+2. **双接口单账号精准日度硬上限（均非 1~2 小时恢复，需次日刷新）**：
+   - **`requestSmoothSpus(batch=30)`**：单号单日硬上限精确为 **`90` 次**（第 91 次触发 `403`，静默 2 小时以上仍为 `403`）$\rightarrow$ 脚本默认软锁 **`--max-smooth-daily 85`**；
+   - **`spuTagProducts(p=0)`**：单号单日硬上限约为 **`~112` 次** $\rightarrow$ 脚本默认软锁 **`--max-sputag-daily 92`**（触发即退出码 `44` 优雅保号，绝不升级整号 24h 封禁）；
+   - **单号单日无封号极限产能**：**约 `3,850 ~ 4,150` 个 SPU/天**；
    - **严禁每 30 分钟发探针检测是否解封**——中途发请求会刷新滑动封禁计时器并升级阶梯封禁时长！
-3. **黄金零滑块/零封控配速**：
-   - `58 ~ 76 秒/次`（约 50~53 次/小时，125s 窗口 $\le 2\sim3$ 次，62m 单接口 $\le 55$ 次，62m 总计 $\le 58$ 次）；
+3. **黄金零滑块/零封控配速与实测耗时校准**：
+   - `62 ~ 78 秒/次`（超保守 `68 ~ 88 秒/次`），每满 `30` 次请求深休 `5 ~ 10 分钟`，125s 窗口 $\le 2\sim3$ 次；
+   - **实测全周期单批耗时约 `~92 秒/批`**（包含延迟 + 接口往返 + 每 3 批导出数千行 Excel 耗时），估算剩余时间必须按逐分类 $\sum \lceil \text{rem}_i / 30 \rceil \times 92\text{s}$ + 波次休眠计算；
    - `requestSmoothSpus` 严格 `batch=30`，且调用前强制检查并注入 `c.allSortedSpuId = all_ids`（防止换号/刷新页面后 `c.allSortedSpuId` 为空导致不写回 `c.spus`）。
 
 ---
@@ -43,7 +48,7 @@
 ## 三、换号连坐锁号、免 F12 登录与 B/C 端共存三大工程暗坑
 
 ### 1. 跨子域 `localStorage` 污染与设备指纹连坐（踩过两次的大坑）
-- **污染链路 1（秒 403）**：在 `h5.waimai.meituan.com` 点退出登录后，独立子域 **`cactivityapi-sc.waimai.meituan.com`** 的 `localStorage` 仍残留 `shangou_wx_set_info` 和 `saber-vma:user-info`。逆向前端 `/utils/business/deal-region-set.js` 证实，只要 `shangou_wx_set_info` 存在，页面就会无视当前登录的新账号，强行把旧被封账号 ID 拼在 URL 后（`?ui=3776626245`），导致新号首包秒 `403`！
+- **污染链路 1（秒 403）**：在 `h5.waimai.meituan.com` 点退出登录后，独立子域 **`cactivityapi-sc.waimai.meituan.com`** 的 `localStorage` 仍残留 `shangou_wx_set_info` 和 `saber-vma:user-info`。逆向前端 `/utils/business/deal-region-set.js` 证实，只要 `shangou_wx_set_info` 存在，页面就会无视当前登录的新账号，强行把旧被封账号 ID 拼在 URL 后（`?ui=<旧号userId>`），导致新号首包秒 `403`！
 - **污染链路 2（登录即触发 `user_err_user_locked_mobile`）**：若只删 `token`/`oops`/`mt_c_token` 而保留 `WEBDFPID`、`uuid`、`iuuid`、`openh5_uuid`、`_lxsdk*`、`localStorage.dfpId`、`localStorage.localId`、`indexedDB("dfp_db")`，美团通行证 `passport.meituan.com` 会把新号与刚被 403 的设备指纹直接关联，短信登录瞬间弹窗锁号（“检测到您的账号存在异常，已将账号锁定”）。
 - **彻底根治（`scripts/prepare_clean_login.py`）**：
   - 使用 CDP `Storage.clearDataForOrigin` 一次性清空 `cactivityapi-sc.waimai.meituan.com`、`h5.waimai.meituan.com`、`passport.meituan.com` 三个域的 `local_storage,indexeddb,cache_storage`；

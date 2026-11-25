@@ -49,21 +49,37 @@ python3 scripts/crawl_h5_store.py --inspect-only --port 9222
   然后请用户在弹出的 390px 卡片里登录美团账号（**切勿按 F12**），切到目标城市/地标并点击进入目标竞对门店页。
 - **情况 B：已进入门店页** $\rightarrow$ 核对 `--inspect-only` 返回的 `poi_name`、`address`、`poi_id_str` 是否与用户指定的目标分店 **100% 一致**（严防同名分店爬错，例如 `满佳喜超市（长清店）` vs `满佳喜超市（长清大学城店）`）。
 
-### Step 4：启动全店防风控断点续传采集（后台自动增量导出 27 列标准 Excel）
+### Step 4：启动全店防风控断点续传采集（后台自动增量导出 27 列标准 Excel + 单日保号软锁）
 ```bash
 python3 scripts/crawl_h5_store.py \
   --port 9222 \
   --poi-id-str "<核验后的poi_id_str>" \
   --poi-name "<核验后的目标店名>" \
   --out-dir "<本地数据目录，如 ./crawl_data/store_a>" \
-  --excel-out-dir "<最终Excel输出目录，如 .>"
+  --excel-out-dir "<最终Excel输出目录，如 .>" \
+  --min-delay 62 --max-delay 78 --hourly-cap 45 \
+  --wave-size 30 --wave-rest-sec 300 \
+  --max-sputag-daily 92 --max-smooth-daily 85
 ```
 - 脚本每 3 次请求及每个阶段结束都会自动调用 `scripts/export_competitor_excel.py` 增量生成/更新 `{MMDD}{店铺名称}.xlsx`，并打印自检统计。
-- 支持随时中断与断点续传（状态持久化在 `<out-dir>/spus.jsonl`、`categories.json`、`timestamps.json`、`progress.json`）。
+- **单日安全软熔断（退出码 `44`）**：脚本通过 `<out-dir>/daily_quota.json` 实时记账，在 `smoothRender` 达到 **`85` 次**（低于 `90` 次日度硬顶）或 `spuTagProducts(p=0)` 达到 **`92` 次**（低于 `~112` 次日度硬顶）时**提前优雅停机保号**，绝不撞穿封号红线！
+- 支持随时中断与断点续传（状态持久化在 `<out-dir>/spus.jsonl`、`categories.json`、`timestamps.json`、`daily_quota.json`、`progress.json`）。
 
-### Step 5：若中途触发 `403`（脚本自动以退出码 `43` 熔断停机）
-- **脚本已自动完成三件事**：落盘已采数据 + 导出最新 27 列 Excel + 自动运行 `prepare_clean_login.py` 清干净跨子域设备指纹并打开新登录页。
-- **严禁做任何定时轮询或重试**！请用户直接登录备用美团账号（若同一宽带 IP 今日已连续触发多次 `403`，请切 **手机 4G/5G 个人热点**，严禁开 VPN/机房代理），重新进入目标门店后**原样重跑 Step 4 命令即可从断点无缝续采**。
+### Step 5：多账号独立会话池存档与无感接力（退出码 `44` 保号停机或 `43` 遇 403）
+- **使用 `scripts/account_pool.py` 管理多账号私密会话池**（存储于本机 `~/.meituan_jingdui_accounts.json`，`chmod 600`，**绝不提交到 Git**）：
+  ```bash
+  # 1. 保存当前已登录 C 端账号（整包保存 C 端 Cookie + 专属设备指纹 + 跨子域 localStorage + 今日已用配额，严格保护 B 端）
+  python3 scripts/account_pool.py save --port 9222 --label "尾号XXXX" --phone "XXXX" --sync-quota-from "<out-dir>/daily_quota.json"
+
+  # 2. 查看账号池内所有账号与当日剩余安全配额（脱敏输出，不打印明文 Token）
+  python3 scripts/account_pool.py list
+
+  # 3. 当某号触发退出码 44（单日保号停机）后，一键切到池中下一个有余量的账号无缝续爬（无需重新扫码收验证码！）
+  python3 scripts/account_pool.py next --need smooth
+  python3 scripts/account_pool.py switch --port 9222 --account "尾号YYYY"
+  ```
+- 若池中暂无备用号且需录入新号：先跑 `python3 scripts/prepare_clean_login.py --port 9222` 清干净跨三域指纹并打开 390px 免 F12 登录卡片，登录新号后执行 `account_pool.py save` 存档，再重置本次任务的 `daily_quota.json` / `timestamps.json` 并原样重跑 Step 4 命令即可断点续采。
+- **严禁做任何定时轮询重试 403**！若同一宽带 IP 今日已连续触发多次整号 403，换号前请切 **手机 4G/5G 个人热点** 或独享国内住宅/4G 静态代理（严禁机房/隧道轮换代理）。
 
 ---
 
@@ -99,9 +115,13 @@ python3 scripts/crawl_h5_store.py \
   }
   ```
 
-### 铁律 3：零 `418` 滑块 / 零 `403` 封控的黄金配速与单号日配额真相
-- **黄金节奏**：单次请求间隔 **`58 ~ 76 秒`**（约 `50 ~ 53` 次/小时），125 秒滑动窗口内 $\le 2\sim3$ 次请求，62 分钟单接口上限 `55` 次、总请求上限 `58` 次（时间戳持久化至 `timestamps.json` 防重启超速）。实测连续 43 次 `requestSmoothSpus(batch=30)` **0 次 418 滑块、0 次 403**，1 小时稳收 1,300~1,500 个 SPU。
-- **单账号日度配额真相**：`spuTagProducts` 单账号单日硬上限约 **`112 次请求`**（且属于日度/12~24 小时跨天封禁，**不是** 1 小时解封！）。一家 8,000+ SPU 超大店通常需 1~2 个账号接力或跨天续跑，请提前规划，绝不可盲目提速硬冲。
+### 铁律 3：零 `418` 滑块 / 零 `403` 封控的黄金配速与单号双接口日配额铁律（2026-11-25 4,622 SPU 二次实证更新）
+- **黄金节奏**：单次请求间隔 **`62 ~ 78 秒`**（超保守模式 `68 ~ 88 秒`），每满 **`30` 次请求主动深休 `5 ~ 10 分钟`**，125 秒滑动窗口内 $\le 2\sim3$ 次请求，62 分钟单接口上限 $\le 45\sim55$ 次（时间戳持久化至 `timestamps.json` 防重启超速）。实测累计 **217 次请求全程 0 次 418 滑块**！
+- **单账号双接口精准日度配额（均属日度/跨天配额，非 1~2 小时冷却！）**：
+  1. **`requestSmoothSpus(batch=30)`**：单号单日硬上限精确为 **`90` 次**（实测在 33 次/小时 + 每 30 次休 10 分钟的超慢节奏下，第 1~90 次全部 `200 OK`、第 **91 次**精准返回 `403`，且静默冷却满 **2 小时 4 分钟**后单点探测仍为 `403`，证实为日度配额）$\rightarrow$ 代码默认软锁 **`--max-smooth-daily 85`**；
+  2. **`spuTagProducts(p=0)`**：单号单日硬上限约 **`~112` 次** $\rightarrow$ 代码默认软锁 **`--max-sputag-daily 92`**（达到后返回退出码 `44` 优雅停机保号，绝不碰封号红线）；
+  3. **单号单日零封号精准产能**：`85 × 30`（~2,550 SPU）+ `92` 次 `p=0`（~1,300~1,600 SPU）= **约 `3,850 ~ 4,150` 个 SPU/天/号**（实测单号零滑块零封号拿下 `3,864` SPU）。4,000 品以内门店 1 号 1 天收官；4,000+ 品大店用 `account_pool.py` 切第 2 号接力或次日同号续跑。
+- **精准 ETA 估算纪律（严禁拍脑袋 `总数 ÷ 30`）**：必须按**逐分类向上取整批次数** $\sum \lceil \text{rem}_i / 30 \rceil$ 乘以 **实测全周期单批耗时（`~92 秒/批`，含延迟 + 接口 + 每 3 批导出 Excel 耗时）** 再加波次深休时间估算完工时间。
 
 ### 铁律 4：触发 `403` 立即硬熔断停机——严禁轮询探测、严禁买“逆向签名”
 - **严禁每 30 分钟发探针检测是否解封**：实测证实第 1 次 `403` 若不停机或每 30 分钟发请求探测，会不断刷新冷却窗口并将单接口限流升级为全账号 `openresty` `X-Forbid-Code` 阶梯长封（12~24 小时）！
@@ -125,8 +145,9 @@ python3 scripts/crawl_h5_store.py \
 - **坑点**：同一 Chrome 内开着美团闪购商家后台（`shangoue.meituan.com`）时，B 端心跳会不定时清空根域 `.meituan.com` 下的 `token` Cookie，导致 H5 外卖端中途突然报 `code=408`（“自动退出”），但 C 端真实的 `oops` / `mt_c_token` / `localStorage.shangou_user` 依然完好。
 - **已固化**：`crawl_h5_store.py` 与 `fetch_spu_details.py` 每次请求前都会自动检查并用 `oops`/`mt_c_token`/`localStorage.shangou_user` 通过 `document.cookie` + CDP `Network.setCookie` 双写回 `.meituan.com`，彻底免重登自愈。
 
-### 铁律 8：换号防 IP 关联嫌疑分 + 拟人触摸/UI 同步
-- **IP 策略**：网关硬 `403` 锁的是 `userId` 而非宽带 IP，但同一宽带 IP 在 24 小时内连挂多号会抬高 Yoda/H5guard 初始嫌疑分（更易弹滑块）。**绝对不要用 VPN 或机房代理 IP**（美团零容忍）；最稳妥方案是连 **手机 4G/5G 个人热点**（运营商原生 CGNAT 高信誉池，开关飞行模式 5 秒即换新基站 IP）。
+### 铁律 8：换号/多并发 IP 策略 + 拟人触摸/UI 同步
+- **单窗换号 IP 策略**：网关硬 `403` 锁的是 `userId` 而非宽带 IP，但同一宽带 IP 在 24 小时内连挂多号会抬高 Yoda/H5guard 初始嫌疑分（更易弹滑块）。**严禁使用 VPN、机房 IDC 代理或高频轮换隧道代理**（美团对机房段与跨省乱跳零容忍）；最稳妥方案是连 **手机 4G/5G 个人热点**（运营商原生 CGNAT 高信誉池，开关飞行模式 5 秒即换新基站 IP）。
+- **多账号并发提速 IP 铁律**：如需多窗口并行抓取（如 5 账号并行将 5 小时压到 1 小时），**严禁 5 个窗口共用同一条家庭宽带同时扫同一家店**（会叠加 IP 频次触发连坐锁号）。每个并发 Chrome 窗口（独立 `--user-data-dir`）必须固定绑定 1 条**中国大陆独享静态/长效住宅家宽或 4G 移动代理**（`HTTP/SOCKS5`，单号固定 IP 长期不漂移）。
 - **前端真实行为特征**：脚本内置 `_onTouchMove` 移动端触摸轨迹（填充 `/api/rohr.js` 的 `mT`/`tT`）、`MouseEvent`/`scroll`、切换分类调用 `_lxFirstCategoryClick` / `_lxSecondCategoryClick` / `_highlightTag`、渲染 DOM 卡片触发商品缩略图加载（消除“百次请求 0 图片加载”特征），以及自动清除 `verify.meituan.com` 回跳残留的 `code=121044`/`request_code`/`response_code`。
 
 ---
