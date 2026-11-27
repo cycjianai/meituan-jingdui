@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """
 Step 2 On-Demand Single-Product Detail & Image Fetcher (`fetch_spu_details.py`)
-Part of the `meituanjingdui` skill.
+Part of the `meituanjingdui` skill (Compliant Polite-Pacing Edition).
 
-Fetches carousel sub-images (`pictures`), graphic detail long images (`pic_content.contents`),
-structured product attributes (`standard_productinfo_list`), sub-spec images (`skus[].picture`),
-and text description (`description`) via `getCurrentPages()[0].api.productInfoV2` (`/quickbuy/v2/poi/product/info`)
-for selected new/hot competitor products that need to be assembled into our own store's assortment.
+Principles:
+- Uses only the user's open, logged-in regular Chrome store tab.
+- Pure time-based polite rate-limiting (`20~30s` delay, `<=38` reqs/hour) with ZERO synthetic touch/mouse spoofing
+  and ZERO cookie/fingerprint modification.
+- Immediate clean stop (saving collected details) on verification challenge (`verify.meituan.com` / 418 -> exit 42)
+  or HTTP 403/406 restriction (-> exit 43).
 """
 import argparse
 import asyncio
 import json
 import os
+import random
 import re
 import sys
+import time
 import urllib.request
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
-from websockets.exceptions import WebSocketException
+import websockets
 
-from crawl_h5_store import StorePage, connect_store_tab
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
 from export_competitor_excel import (
     clean_pic_url,
     extract_sku_pricing_and_promo,
@@ -27,21 +34,115 @@ from export_competitor_excel import (
 )
 
 
-async def fetch_one_spu_detail(page, poi_id, spu_id, fallback):
-    result = await page.in_store(poi_id, f"""
-        const res = checked(await p.api.productInfoV2({{
-            wm_poi_id: p.data.poiId || -100,
-            poi_id_str: p.data.poi_id_str,
-            spu_id: {json.dumps(spu_id)},
-            sku_id: 0,
-            spu_tag: {json.dumps(str(fallback.get('tag') or ''))},
-            activity_tag: {json.dumps(str(fallback.get('activity_tag') or ''))}
-        }}));
-        return res && res.data;
-    """)
-    if not result:
-        raise RuntimeError(f'SPU {spu_id}: no product data returned.')
-    return result
+def fetch_json(url, timeout=5.0):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.loads(r.read().decode('utf-8'))
+
+
+def get_store_ws_url(port=9222):
+    targets = fetch_json(f'http://127.0.0.1:{port}/json/list')
+    page_tabs = [t for t in targets if t.get('type') == 'page']
+    for pattern in ('cactivityapi-sc.waimai.meituan.com', 'verify.meituan.com', 'wx-shangou.meituan.com', 'h5.waimai.meituan.com'):
+        for t in page_tabs:
+            u = t.get('url', '')
+            if pattern in u:
+                return t['webSocketDebuggerUrl'], u
+    raise RuntimeError(f'No open Meituan H5 store tab found on port {port}')
+
+
+class StoreDetailClient:
+    def __init__(self, port=9222, min_delay=20.0, max_delay=30.0):
+        self.port = port
+        self.min_delay = min_delay
+        self.max_delay = max_delay
+        self.ws_url = None
+        self.msg_id = 1
+        self.req_timestamps = []
+        self.connect()
+
+    def connect(self):
+        v = fetch_json(f'http://127.0.0.1:{self.port}/json/version')
+        if v.get('webSocketDebuggerUrl'):
+            self._cdp_on(v['webSocketDebuggerUrl'], 'Browser.setDownloadBehavior', {'behavior': 'default'})
+        self.ws_url, _ = get_store_ws_url(self.port)
+
+    def _cdp_on(self, ws_url, method, params=None):
+        self.msg_id += 1
+        cur_id = self.msg_id
+
+        async def _call():
+            async with websockets.connect(ws_url, max_size=50 * 1024 * 1024) as ws:
+                await ws.send(json.dumps({'id': cur_id, 'method': method, 'params': params or {}}))
+                while True:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                    data = json.loads(raw)
+                    if data.get('id') == cur_id:
+                        return data
+
+        return asyncio.run(_call())
+
+    def cdp(self, method, params=None):
+        return self._cdp_on(self.ws_url, method, params)
+
+    def eval_js(self, expr, await_promise=True):
+        res = self.cdp('Runtime.evaluate', {
+            'expression': expr,
+            'awaitPromise': await_promise,
+            'returnByValue': True,
+        })
+        return res.get('result', {}).get('result', {}).get('value')
+
+    def check_not_verify(self, on_stop=None):
+        href = self.eval_js('location.href', await_promise=False) or ''
+        if 'verify.meituan.com' in href:
+            print(f'[STOP_ON_VERIFY] Page redirected to verification challenge ({href[:90]}). Saving and stopping immediately.', flush=True)
+            if on_stop:
+                on_stop()
+            sys.exit(42)
+
+    def polite_sleep(self):
+        time.sleep(random.uniform(self.min_delay, self.max_delay))
+        while True:
+            now = time.time()
+            self.req_timestamps = [t for t in self.req_timestamps if now - t < 3720.0]
+            in_2m = [t for t in self.req_timestamps if now - t < 125.0]
+            if len(in_2m) >= 3:
+                wait_s = 126.0 - (now - in_2m[0]) + random.uniform(4.0, 8.0)
+                if wait_s > 0:
+                    time.sleep(wait_s)
+                    continue
+            if len(self.req_timestamps) >= 38:
+                wait_h = 3725.0 - (now - self.req_timestamps[0]) + random.uniform(20.0, 40.0)
+                if wait_h > 0:
+                    time.sleep(wait_h)
+                    continue
+            break
+        self.req_timestamps.append(time.time())
+
+    def fetch_one_spu_detail(self, spu_id, spu_tag='', activity_tag='', on_stop=None):
+        self.check_not_verify(on_stop=on_stop)
+        self.polite_sleep()
+        self.check_not_verify(on_stop=on_stop)
+        js = f"""
+        (async () => {{
+            const p = getCurrentPages()[0];
+            if (!p || !p.api || !p.api.productInfoV2) return {{code: -999, msg: 'no_page'}};
+            try {{
+                const res = await p.api.productInfoV2({{
+                    wm_poi_id: p.data.poiId || -100,
+                    poi_id_str: p.data.poi_id_str,
+                    spu_id: {json.dumps(str(spu_id))},
+                    sku_id: 0,
+                    spu_tag: {json.dumps(str(spu_tag or ''))},
+                    activity_tag: {json.dumps(str(activity_tag or ''))}
+                }});
+                return {{code: res.code, data: res.data || null, msg: res.msg || ''}};
+            }} catch (e) {{
+                return {{code: -500, msg: String(e.message || e)}};
+            }}
+        }})()
+        """
+        return self.eval_js(js, await_promise=True)
 
 
 def extract_detail_fields(raw_detail, fallback_spu=None):
@@ -135,7 +236,7 @@ def export_details_excel(details_jsonl, out_xlsx):
         '原价(元)', '直接折扣价(元)', '实时库存',
         '品牌', '产地', '净含量/规格参数', '保质期', '完整商品属性参数表(standard_productinfo_list)',
         '图文卖点描述(description)',
-        '高清无水印主图URL', '轮播副图URL列表(竖线分隔)', '商品详情长图URL列表(竖线分隔)', '子规格图片URL'
+        '高清无水印主图URL', '轮播副图URL列表(竖线分隔)', '商品详情长图URL列表(竖线分隔)', '子规格图片URL',
     ]
     ws.append(headers)
     for cell in ws[1]:
@@ -193,37 +294,17 @@ def export_details_excel(details_jsonl, out_xlsx):
     print(f"[Details Excel Saved] {len(records)} SPUs exported to {out_xlsx}", flush=True)
 
 
-async def fetch_details(args, target_ids, done_ids, spu_lookup):
-    pending = [sid for sid in dict.fromkeys(target_ids) if sid not in done_ids]
-    if not pending:
-        return
-    async with connect_store_tab(args.port) as ws:
-        page = StorePage(ws)
-        state = await page.inspect()
-        if not state['inStorePage'] or not state['poi_id_str']:
-            raise RuntimeError('Open the target store page in Chrome first.')
-        for idx, sid in enumerate(pending, 1):
-            fb = spu_lookup.get(sid) or {}
-            detail = await fetch_one_spu_detail(page, state['poi_id_str'], sid, fb)
-            rec = {'spu_id': sid, 'detail': detail, 'spu': fb}
-            os.makedirs(os.path.dirname(os.path.abspath(args.out_jsonl)), exist_ok=True)
-            with open(args.out_jsonl, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + '\n')
-            parsed = extract_detail_fields(detail, fb)
-            print(f"[{idx}/{len(pending)}] SPU {sid} ({parsed['name'][:20]}) -> 副图:{len(parsed['sub_pics'])}张, 详情长图:{len(parsed['detail_pics'])}张, 属性:{len(parsed['props_dict'])}项", flush=True)
-            if args.download_images_dir:
-                download_spu_images(parsed, args.download_images_dir)
-
-
 def main():
-    parser = argparse.ArgumentParser(description='Fetch Meituan H5 Single-Product Details (Carousel Sub-Images, Detail Images, Attributes)')
+    parser = argparse.ArgumentParser(description='Fetch Meituan H5 Single-Product Details (Compliant Polite-Pacing Edition)')
     parser.add_argument('--spu-ids', default='', help='Comma-separated SPU IDs to fetch')
-    parser.add_argument('--spus-jsonl', default='', help='Optional path to existing spus.jsonl to look up tag/fallback info or filter top sales')
-    parser.add_argument('--top-n-sales', type=int, default=0, help='Automatically select top N SPUs by monthly sales from --spus-jsonl')
+    parser.add_argument('--spus-jsonl', default='', help='Optional path to existing spus.jsonl')
+    parser.add_argument('--top-n-sales', type=int, default=0, help='Select top N SPUs by monthly sales from --spus-jsonl')
     parser.add_argument('--out-jsonl', required=True, help='Output JSONL path for fetched product details')
     parser.add_argument('--out-xlsx', required=True, help='Output Excel path for new-product assembly')
-    parser.add_argument('--download-images-dir', default='', help='Optional directory to download main/sub/detail images')
+    parser.add_argument('--download-images-dir', default='', help='Optional directory to download images')
     parser.add_argument('--port', type=int, default=9222, help='Chrome remote debugging port')
+    parser.add_argument('--min-delay', type=float, default=20.0, help='Minimum delay between requests in seconds (default: 20)')
+    parser.add_argument('--max-delay', type=float, default=30.0, help='Maximum delay between requests in seconds (default: 30)')
     args = parser.parse_args()
 
     spu_lookup = {}
@@ -238,7 +319,7 @@ def main():
         sorted_spus = sorted(
             spu_lookup.values(),
             key=lambda x: parse_monthly_sales(x.get('month_saled_content'), x.get('month_saled')),
-            reverse=True
+            reverse=True,
         )
         target_ids = [str(s['id']) for s in sorted_spus[:args.top_n_sales]]
 
@@ -249,15 +330,39 @@ def main():
     if os.path.exists(args.out_jsonl):
         for line in open(args.out_jsonl, 'r', encoding='utf-8'):
             if line.strip():
-                obj = json.loads(line)
-                done_ids.add(str(obj.get('spu_id')))
+                done_ids.add(str(json.loads(line).get('spu_id')))
 
-    try:
-        asyncio.run(fetch_details(args, target_ids, done_ids, spu_lookup))
-    except (RuntimeError, OSError, WebSocketException) as exc:
-        sys.exit(str(exc))
-    finally:
-        export_details_excel(args.out_jsonl, args.out_xlsx)
+    save_cb = lambda: export_details_excel(args.out_jsonl, args.out_xlsx)
+    client = StoreDetailClient(port=args.port, min_delay=args.min_delay, max_delay=args.max_delay)
+    for idx, sid in enumerate(target_ids, 1):
+        if sid in done_ids:
+            print(f'[{idx}/{len(target_ids)}] SPU {sid} already fetched, skipping.', flush=True)
+            continue
+        fb = spu_lookup.get(sid) or {}
+        res = client.fetch_one_spu_detail(sid, spu_tag=fb.get('tag', ''), activity_tag=fb.get('activity_tag', ''), on_stop=save_cb)
+        err_msg = str((res or {}).get('msg') or '')
+        if '418' in err_msg or 'verify' in err_msg.lower():
+            print(f'[STOP_ON_VERIFY] productInfoV2 hit verification challenge ({err_msg}) on SPU {sid}. Saving and halting.', flush=True)
+            save_cb()
+            sys.exit(42)
+        if '403' in err_msg or '406' in err_msg:
+            print(f'[STOP_ON_403] productInfoV2 returned {err_msg} on SPU {sid}. Saving and halting.', flush=True)
+            save_cb()
+            sys.exit(43)
+        if not res or res.get('code') != 0 or not res.get('data'):
+            print(f'[{idx}/{len(target_ids)}] SPU {sid} returned code={res.get("code") if res else None} msg={err_msg}, stopping.', flush=True)
+            save_cb()
+            sys.exit(1)
+        rec = {'spu_id': sid, 'detail': res['data'], 'spu': fb}
+        os.makedirs(os.path.dirname(os.path.abspath(args.out_jsonl)), exist_ok=True)
+        with open(args.out_jsonl, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        parsed = extract_detail_fields(res['data'], fb)
+        print(f"[{idx}/{len(target_ids)}] SPU {sid} ({parsed['name'][:20]}) -> 副图:{len(parsed['sub_pics'])}张, 详情长图:{len(parsed['detail_pics'])}张, 属性:{len(parsed['props_dict'])}项", flush=True)
+        if args.download_images_dir:
+            download_spu_images(parsed, args.download_images_dir)
+
+    save_cb()
 
 
 if __name__ == '__main__':
