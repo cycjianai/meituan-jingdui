@@ -40,6 +40,8 @@ description: 通过用户本机已登录常规 Chrome 的美团外卖 H5 门店�
 5. **页面重载 `poi_id_str` 重加密与门店动态改分类自愈**：核验 `店名 + 详细地址` 100% 一致后自动衔接新加密 `poi_id_str`；若商家中途新增/调整分类导致下标偏移，自动按分类唯一 `tag` 重新对齐 `categories.json`，绝不中途崩断。
 6. **大店单号配额智能规划 + 自动出分析报告**：扫完一级分类后若剩余批次数超出 `smooth` 额度，自动优先用剩余 `sputag` 额度采集高产二级子分类首屏分流大类；收尾自动调用 `scripts/analyze_competitor_store.py` 输出 `{MMDD}{店铺名称}_数据分析报告.md`。
 
+> **实战协议与操作避坑手册（必读）**：关于「为什么严禁调 `spuTagProducts(page_index>=1)` 翻页」「为什么 `smoothRender` 必须固定 `batch=30`」「为什么单老号一天能稳跑 7,000~8,000 行 SKU 而 6,000+ SPU 超大仓需分 2 天」「为什么绝不能按 F12 登录（拉窄窗口至 420px 即可）」「为什么要用独立 `--user-data-dir` 与商家端后台隔离防 `408` 掉线」，详见 [engineering_lessons.md](references/engineering_lessons.md)。
+
 ---
 
 ## 1. 标准启动流程
