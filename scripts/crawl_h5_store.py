@@ -388,6 +388,16 @@ async def run_crawler(args):
     if not target:
         raise RuntimeError(f"Could not find open Meituan H5 store tab in Chrome on port {args.port}. Please log in and open the store page first.")
 
+    has_devtools_tab = any('devtools://' in (t.get('url') or '') for t in tabs)
+    has_bend_tab = any(
+        any(h in (t.get('url') or '') for h in ('shangoue.meituan.com', 'waimaie.meituan.com', 'qnh.meituan.com'))
+        for t in tabs if t.get('type') == 'page'
+    )
+    if has_devtools_tab:
+        print("[ENV_WARN] Detected open F12 DevTools window (devtools://). Please close F12 to avoid abnormal environment flags!", flush=True)
+    if has_bend_tab:
+        print("[ENV_WARN] Detected B-end merchant tabs (shangoue/qnh) in the same Chrome window; using an isolated --user-data-dir for H5 prevents code=408 token conflicts.", flush=True)
+
     async with websockets.connect(target['webSocketDebuggerUrl'], max_size=50 * 1024 * 1024) as ws:
         if args.inspect_only:
             state = await eval_js(ws, 1, '''
@@ -408,6 +418,9 @@ async def run_crawler(args):
                 };
             })()
             ''')
+            if isinstance(state, dict):
+                state['hasDevToolsOpen'] = has_devtools_tab
+                state['hasBEndTabsOpen'] = has_bend_tab
             print(json.dumps(state, ensure_ascii=False, indent=2), flush=True)
             return
 
@@ -752,70 +765,83 @@ async def run_crawler(args):
         # preserving precious `smoothRender` quota for 0-sub-tag / small tail categories!
         async def run_l2_pass(stop_when_smooth_fits=False):
             nonlocal msg_seq, req_counter
-            candidates = []
-            for m in ordered_tabs:
-                cinfo = cat_map.get(str(m['idx'])) or {}
-                all_ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
-                missing_ids = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
-                sub_tags_list = cinfo.get('sub_tags') or m.get('sub_tags') or []
-                sub_left = sum(1 for s_i, st in enumerate(sub_tags_list) if s_i > 0 and st.get('name') != '全部' and not st.get('allSortedSpuId'))
-                if len(missing_ids) >= 20 and sub_left > 0:
-                    candidates.append((len(missing_ids) / sub_left, len(missing_ids), m))
-            candidates.sort(key=lambda item: (-item[0], -item[1]))
+            for allow_low_yield in (False, True):
+                candidates = []
+                for m in ordered_tabs:
+                    cinfo = cat_map.get(str(m['idx'])) or {}
+                    all_ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
+                    missing_ids = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
+                    sub_tags_list = cinfo.get('sub_tags') or m.get('sub_tags') or []
+                    sub_left = sum(1 for s_i, st in enumerate(sub_tags_list) if s_i > 0 and st.get('name') != '全部' and not st.get('allSortedSpuId'))
+                    if len(missing_ids) >= 20 and sub_left > 0:
+                        # Prioritize big shelves (>=60 missing SPUs) first, then highest expected yield per sub-tag
+                        candidates.append((1 if len(missing_ids) >= 60 else 0, len(missing_ids), len(missing_ids) / sub_left, m))
+                candidates.sort(key=lambda item: (-item[0], -item[1], -item[2]))
+                if not candidates:
+                    return
 
-            for step_num, (_, _, m) in enumerate(candidates, 1):
-                idx, name, tag = m['idx'], m['name'], m['tag']
-                cinfo = cat_map.get(str(idx)) or {}
-                all_ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
-                sub_tags_list = cinfo.get('sub_tags') or m.get('sub_tags') or []
-                cinfo['sub_tags'] = sub_tags_list
-                for s_idx, st in enumerate(sub_tags_list):
-                    if s_idx == 0 or st.get('name') == '全部' or st.get('allSortedSpuId'):
-                        continue
-                    if not [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]:
-                        break
-                    if stop_when_smooth_fits and args.max_smooth_daily > 0:
-                        rem_sm_cap = max(0, args.max_smooth_daily - quota_ledger.count_24h('smooth'))
-                        cur_sm_need = compute_remaining_smooth_batches(ordered_tabs, cat_map, seen_spus, unfetchable_ids)
-                        if cur_sm_need <= max(0, rem_sm_cap - 2):
-                            print(f"[Smart Planner] Remaining smoothRender batches ({cur_sm_need}) now fit safely within 24h smooth quota ({rem_sm_cap}) -> switching to smoothRender sweep!", flush=True)
+                progressed = False
+                for step_num, (_, _, _, m) in enumerate(candidates, 1):
+                    idx, name, tag = m['idx'], m['name'], m['tag']
+                    cinfo = cat_map.get(str(idx)) or {}
+                    all_ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
+                    sub_tags_list = cinfo.get('sub_tags') or m.get('sub_tags') or []
+                    cinfo['sub_tags'] = sub_tags_list
+                    low_yield_streak = 0
+                    for s_idx, st in enumerate(sub_tags_list):
+                        if s_idx == 0 or st.get('name') == '全部' or st.get('allSortedSpuId'):
+                            continue
+                        if not [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]:
+                            break
+                        if stop_when_smooth_fits and args.max_smooth_daily > 0:
+                            rem_sm_cap = max(0, args.max_smooth_daily - quota_ledger.count_24h('smooth'))
+                            cur_sm_need = compute_remaining_smooth_batches(ordered_tabs, cat_map, seen_spus, unfetchable_ids)
+                            if cur_sm_need <= max(0, rem_sm_cap - 2):
+                                print(f"[Smart Planner] Remaining smoothRender batches ({cur_sm_need}) now fit safely within 24h smooth quota ({rem_sm_cap}) -> switching to smoothRender sweep!", flush=True)
+                                return
+                        if quota_ledger.count_24h('sputag') >= args.max_sputag_daily:
+                            print(f"[DAILY_QUOTA_GUARD] spuTagProducts reached 24h soft cap ({quota_ledger.count_24h('sputag')}/{args.max_sputag_daily}).", flush=True)
                             return
-                    if quota_ledger.count_24h('sputag') >= args.max_sputag_daily:
-                        print(f"[DAILY_QUOTA_GUARD] spuTagProducts reached 24h soft cap ({quota_ledger.count_24h('sputag')}/{args.max_sputag_daily}).", flush=True)
-                        return
 
-                    st_name = st.get('name', '')
-                    req_counter += 1
-                    await polite_sleep(req_counter, ts_json, endpoint='sputag_p0', export_cb=export_current_excel, **pacing_kw)
-                    msg_seq, _ = await verify_store_ready_or_stop(ws, msg_seq, store_lock, on_stop=lambda: export_current_excel(run_analysis=True))
-                    quota_ledger.record('sputag')
+                        st_name = st.get('name', '')
+                        req_counter += 1
+                        await polite_sleep(req_counter, ts_json, endpoint='sputag_p0', export_cb=export_current_excel, **pacing_kw)
+                        msg_seq, _ = await verify_store_ready_or_stop(ws, msg_seq, store_lock, on_stop=lambda: export_current_excel(run_analysis=True))
+                        quota_ledger.record('sputag')
 
-                    msg_seq += 1
-                    res = await eval_js(ws, msg_seq, f'''
-                    (async () => {{
-                        const p = getCurrentPages()[0];
-                        const c = p._getCachedData({idx}, {s_idx});
-                        if (!c) return {{skip_missing_slot: true, allSortedSpuId: [], spus: []}};
-                        try {{
-                            await p.requestSpusAndSortedIds({idx}, {s_idx}, c.tag, c.type, 0, true);
-                        }} catch (err) {{
-                            return {{error: String(err.message || err)}};
-                        }}
-                        const c2 = p._getCachedData({idx}, {s_idx}) || c;
-                        return {{allSortedSpuId: c2.allSortedSpuId || [], spus: c2.spus || []}};
-                    }})()
-                    ''')
-                    if res and res.get('skip_missing_slot'):
-                        continue
-                    if res and res.get('error'):
-                        handle_stop_error(f"L2 Cat[{idx}] Sub[{s_idx}] {st_name}", str(res['error']))
+                        msg_seq += 1
+                        res = await eval_js(ws, msg_seq, f'''
+                        (async () => {{
+                            const p = getCurrentPages()[0];
+                            const c = p._getCachedData({idx}, {s_idx});
+                            if (!c) return {{skip_missing_slot: true, allSortedSpuId: [], spus: []}};
+                            try {{
+                                await p.requestSpusAndSortedIds({idx}, {s_idx}, c.tag, c.type, 0, true);
+                            }} catch (err) {{
+                                return {{error: String(err.message || err)}};
+                            }}
+                            const c2 = p._getCachedData({idx}, {s_idx}) || c;
+                            return {{allSortedSpuId: c2.allSortedSpuId || [], spus: c2.spus || []}};
+                        }})()
+                        ''')
+                        if res and res.get('skip_missing_slot'):
+                            continue
+                        if res and res.get('error'):
+                            handle_stop_error(f"L2 Cat[{idx}] Sub[{s_idx}] {st_name}", str(res['error']))
 
-                    st['allSortedSpuId'] = [int(x) for x in ((res or {}).get('allSortedSpuId') or [])]
-                    added = record_spus((res or {}).get('spus') or [], idx, name, tag)
-                    with open(cat_map_json, 'w', encoding='utf-8') as cf:
-                        json.dump(cat_map, cf, ensure_ascii=False, indent=2)
-                    save_progress('Pass_L2_p0', step_num, len(ordered_tabs), idx, f"{name}/{st_name}")
-                    print(f"  -> [L2 p=0] Cat[{idx}] {name} / Sub[{s_idx}] {st_name}: +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
+                        progressed = True
+                        st['allSortedSpuId'] = [int(x) for x in ((res or {}).get('allSortedSpuId') or [])]
+                        added = record_spus((res or {}).get('spus') or [], idx, name, tag)
+                        with open(cat_map_json, 'w', encoding='utf-8') as cf:
+                            json.dump(cat_map, cf, ensure_ascii=False, indent=2)
+                        save_progress('Pass_L2_p0', step_num, len(ordered_tabs), idx, f"{name}/{st_name}")
+                        print(f"  -> [L2 p=0] Cat[{idx}] {name} / Sub[{s_idx}] {st_name}: +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
+                        if not allow_low_yield:
+                            low_yield_streak = (low_yield_streak + 1) if added <= 2 else 0
+                            if low_yield_streak >= 2 and len(candidates) > 1:
+                                break
+                if not progressed:
+                    return
 
         needed_smooth = compute_remaining_smooth_batches(ordered_tabs, cat_map, seen_spus, unfetchable_ids)
         rem_smooth_24h = max(0, args.max_smooth_daily - quota_ledger.count_24h('smooth'))
@@ -837,70 +863,81 @@ async def run_crawler(args):
             await run_l2_pass(stop_when_smooth_fits=True)
             export_current_excel()
 
-        # ==================== PASS 1.5: Smooth pagination batch=30 ====================
+        # ==================== PASS 1.5: Smooth pagination batch=30 (Full-30 Batches First!) ====================
+        # Always prioritize full 30-item batches across all categories before spending precious smooth quota
+        # on small 1~10 item category remainders. This maximizes single-account daily yield (+500~700 SPUs on large stores).
         smooth_capped = bool(quota_ledger.count_24h('smooth') >= args.max_smooth_daily)
-        for step_num, m in enumerate(ordered_tabs, 1):
-            if smooth_capped:
+        while not smooth_capped:
+            if quota_ledger.count_24h('smooth') >= args.max_smooth_daily:
+                print(f"[DAILY_QUOTA_GUARD] smoothRender reached 24h soft cap ({quota_ledger.count_24h('smooth')}/{args.max_smooth_daily}).", flush=True)
+                smooth_capped = True
                 break
-            idx, name, tag = m['idx'], m['name'], m['tag']
-            sub_idx = 0 if m['hasSub'] else -1
-            cinfo = cat_map.get(str(idx)) or {}
-            all_ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
-            if not all_ids:
-                continue
 
-            while not smooth_capped:
-                if quota_ledger.count_24h('smooth') >= args.max_smooth_daily:
-                    print(f"[DAILY_QUOTA_GUARD] smoothRender reached 24h soft cap ({quota_ledger.count_24h('smooth')}/{args.max_smooth_daily}).", flush=True)
-                    smooth_capped = True
-                    break
+            best_choice = None
+            for order_pos, m in enumerate(ordered_tabs, 1):
+                cinfo = cat_map.get(str(m['idx'])) or {}
+                all_ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
+                if not all_ids:
+                    continue
                 missing_ids = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
                 if not missing_ids:
-                    break
-                batch = [str(x) for x in missing_ids[:30]]
-                req_counter += 1
-                await polite_sleep(req_counter, ts_json, endpoint='smooth', export_cb=export_current_excel, **pacing_kw)
-                msg_seq, _ = await verify_store_ready_or_stop(ws, msg_seq, store_lock, on_stop=lambda: export_current_excel(run_analysis=True))
-                quota_ledger.record('smooth')
+                    continue
+                batch_len = min(30, len(missing_ids))
+                # Sort key: largest batch_len (30 first!), then original shelf order_pos
+                cand_key = (batch_len, -order_pos)
+                if best_choice is None or cand_key > best_choice[0]:
+                    best_choice = (cand_key, order_pos, m, all_ids, missing_ids)
 
-                msg_seq += 1
-                res = await eval_js(ws, msg_seq, f'''
-                (async () => {{
-                    const p = getCurrentPages()[0];
-                    const c = p._getCachedData({idx}, {sub_idx});
-                    if (!c) return {{spus: []}};
-                    if (!Array.isArray(c.allSortedSpuId) || !c.allSortedSpuId.length) {{
-                        c.allSortedSpuId = {json.dumps(all_ids)};
-                    }}
-                    const targetIds = {json.dumps(batch)};
-                    try {{
-                        await p.requestSmoothSpus(targetIds, {idx}, {sub_idx}, c.tag, c.type, {{}});
-                        const c2 = p._getCachedData({idx}, {sub_idx}) || c;
-                        const idSet = new Set(targetIds.map(Number));
-                        return {{spus: (c2.spus || []).filter(s => s && idSet.has(Number(s.id)))}};
-                    }} catch (err) {{
-                        return {{error: String(err.message || err)}};
-                    }}
-                }})()
-                ''')
-                if res and res.get('error'):
-                    handle_stop_error(f"Pass1.5 Cat[{idx}] {name}", str(res['error']))
+            if best_choice is None:
+                break
 
-                spus = (res or {}).get('spus') or []
-                returned_ids = {int(s['id']) for s in spus if isinstance(s, dict) and s.get('id')}
-                for bid_str in batch:
-                    bid = int(bid_str)
-                    if bid not in returned_ids and bid not in seen_spus:
-                        unfetchable_ids.add(bid)
-                added = record_spus(spus, idx, name, tag)
-                rem_after = len([x for x in all_ids if x not in seen_spus and x not in unfetchable_ids])
-                save_progress('Pass1.5_smoothRender', step_num, len(ordered_tabs), idx, name)
-                if req_counter % 5 == 0:
-                    rem_b = compute_remaining_smooth_batches(ordered_tabs, cat_map, seen_spus, unfetchable_ids)
-                    rem_eta = estimate_eta_minutes(rem_b, args.min_delay, args.max_delay, args.wave_size, args.wave_rest_sec)
-                    print(f"  -> Cat[{idx}] {name} [batch={len(batch)}, cat_rem={rem_after}]: +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter} | ~{rem_b} batches / ~{rem_eta:.0f}m left)", flush=True)
-                else:
-                    print(f"  -> Cat[{idx}] {name} [batch={len(batch)}, cat_rem={rem_after}]: +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
+            _, step_num, m, all_ids, missing_ids = best_choice
+            idx, name, tag = m['idx'], m['name'], m['tag']
+            sub_idx = 0 if m['hasSub'] else -1
+            batch = [str(x) for x in missing_ids[:30]]
+            req_counter += 1
+            await polite_sleep(req_counter, ts_json, endpoint='smooth', export_cb=export_current_excel, **pacing_kw)
+            msg_seq, _ = await verify_store_ready_or_stop(ws, msg_seq, store_lock, on_stop=lambda: export_current_excel(run_analysis=True))
+            quota_ledger.record('smooth')
+
+            msg_seq += 1
+            res = await eval_js(ws, msg_seq, f'''
+            (async () => {{
+                const p = getCurrentPages()[0];
+                const c = p._getCachedData({idx}, {sub_idx});
+                if (!c) return {{spus: []}};
+                if (!Array.isArray(c.allSortedSpuId) || !c.allSortedSpuId.length) {{
+                    c.allSortedSpuId = {json.dumps(all_ids)};
+                }}
+                const targetIds = {json.dumps(batch)};
+                try {{
+                    await p.requestSmoothSpus(targetIds, {idx}, {sub_idx}, c.tag, c.type, {{}});
+                    const c2 = p._getCachedData({idx}, {sub_idx}) || c;
+                    const idSet = new Set(targetIds.map(Number));
+                    return {{spus: (c2.spus || []).filter(s => s && idSet.has(Number(s.id)))}};
+                }} catch (err) {{
+                    return {{error: String(err.message || err)}};
+                }}
+            }})()
+            ''')
+            if res and res.get('error'):
+                handle_stop_error(f"Pass1.5 Cat[{idx}] {name}", str(res['error']))
+
+            spus = (res or {}).get('spus') or []
+            returned_ids = {int(s['id']) for s in spus if isinstance(s, dict) and s.get('id')}
+            for bid_str in batch:
+                bid = int(bid_str)
+                if bid not in returned_ids and bid not in seen_spus:
+                    unfetchable_ids.add(bid)
+            added = record_spus(spus, idx, name, tag)
+            rem_after = len([x for x in all_ids if x not in seen_spus and x not in unfetchable_ids])
+            save_progress('Pass1.5_smoothRender', step_num, len(ordered_tabs), idx, name)
+            if req_counter % 5 == 0:
+                rem_b = compute_remaining_smooth_batches(ordered_tabs, cat_map, seen_spus, unfetchable_ids)
+                rem_eta = estimate_eta_minutes(rem_b, args.min_delay, args.max_delay, args.wave_size, args.wave_rest_sec)
+                print(f"  -> Cat[{idx}] {name} [batch={len(batch)}, cat_rem={rem_after}]: +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter} | ~{rem_b} batches / ~{rem_eta:.0f}m left)", flush=True)
+            else:
+                print(f"  -> Cat[{idx}] {name} [batch={len(batch)}, cat_rem={rem_after}]: +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
 
         # If smooth hit soft cap and sputag still has 24h allowance, run remaining L2 sub-categories
         if smooth_capped and quota_ledger.count_24h('sputag') < args.max_sputag_daily:
