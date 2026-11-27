@@ -21,8 +21,12 @@ description: 通过用户本机已登录常规 Chrome 的美团外卖 H5 门店�
      - **滚动 24h 单号配额硬上限**：1 号门分类接口 `sputag ≤ 92 次`、2 号门下拉翻页接口 `smooth ≤ 85 次`（两扇门合计 `177 次`，稳跑约 5~5.5 小时，单老号一天可稳采约 4,000~4,600 款 SPU / 7,000~8,000 行多规格 SKU）。
    - **新号 / 低活跃号档（`--account-tier conservative`）**：
      - 若用户使用的是新注册或低活跃账号，必须传 `--account-tier conservative`（强制 `75 ~ 95 秒` 间隔、`≤ 32 次/小时`、满 `25 次` 休眠 `11 分钟`、滚动 24h 上限 `sputag ≤ 28 / smooth ≤ 35`）。不确定账号新老时先向用户确认一句。
-3. **后台耐心长跑（严禁嫌慢改快）**：
-   - 大店采集天然耗时 **2.5 ~ 5.5 小时**。启动后台任务后静默等待系统完成通知即可，**严禁嫌慢去缩短休眠秒数或取消 10 分钟波次深休**（一旦过快把 2 号门 `smooth` 刷出网关 `403`，同浏览器/IP 24 小时内都无法再下拉翻页）。
+3. **后台耐心长跑 + 强制每 5~10 分钟主动播报实时进度（严禁黑盒静默干等）**：
+   - 大店采集天然耗时 **2.5 ~ 5.5 小时**，**严禁嫌慢缩短休眠秒数或取消 10 分钟波次深休**。
+   - **强制实时进度显示要求**：任何 Agent 启动后台采集任务后，**绝不允许只发一句“已启动”就彻底静默几个小时让用户盲等**！必须设置每 **`5 ~ 10 分钟`（`300 ~ 600 秒`）** 一次的任务唤醒/通知检查（例如设置 `NotificationTimeoutSeconds=480` 或注册 8 分钟周期唤醒，任务结束立即取消定时），每次检查运行 `python3 ~/.codex/skills/meituanjingdui/scripts/crawl_h5_store.py --status --out-dir "<断点目录>"` 或读取进程最新 `📊 [实时进度]` 日志，主动向用户简短播报：
+     - **当前阶段与分类**（或提示正处于 10 分钟波次保护休眠中）；
+     - **已采独立商品 SPU 数 / 全店总 SPU 数（完成百分比）+ 已导出 Excel SKU 行数**；
+     - **24h 配额已用进度**（`1号门 sputag X/92`、`2号门 smooth Y/85`）与**本轮预计剩余分钟数（ETA）**。
 4. **合规底线与受阻即停（零反爬伪造）**：
    - 仅读取用户在常规 Chrome（默认端口 `9222`）手动登录并打开的目标门店页；**绝不注入模拟触摸/鼠标轨迹、绝不擦除或改写 Cookie/设备指纹、绝不执行多账号轮换**。
    - 遇到验证页面（`verify.meituan.com` / `418`）：立即保存当前 Excel 与分析报告并以**退出码 `42`** 停机报告用户；
@@ -67,6 +71,9 @@ python3 -u ~/.codex/skills/meituanjingdui/scripts/crawl_h5_store.py --port 9222 
 
 # 新号 / 低活跃号启动（强制 75~95s 间隔、≤32次/h、满25次休11m、24h上限 28/35）
 python3 -u ~/.codex/skills/meituanjingdui/scripts/crawl_h5_store.py --port 9222 --account-tier conservative --excel-out-dir .
+
+# 随时秒查当前实时采集进度、配额消耗与预计剩余时间（0 网络请求）
+python3 ~/.codex/skills/meituanjingdui/scripts/crawl_h5_store.py --status
 ```
 *(如需显式指定分店与目录，可附带 `--poi-name`、`--poi-id-str`、`--out-dir`、`--date-mmdd`；若 2 号门 `smooth` 正处冷却期仅走 1 号门，可加 `--max-smooth-daily 0`。)*
 

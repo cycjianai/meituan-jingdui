@@ -283,10 +283,10 @@ def save_timestamps(ts_json):
 
 
 async def polite_sleep(
-    req_counter, ts_json, endpoint='sputag_p0', export_cb=None,
+    req_counter, ts_json, endpoint='sputag_p0', export_cb=None, heartbeat_cb=None,
     min_delay=68.0, max_delay=88.0, hourly_cap=38, wave_size=30, wave_rest_sec=600.0
 ):
-    """Pure time-based polite rate-limiting (zero synthetic DOM/touch events)."""
+    """Pure time-based polite rate-limiting (zero synthetic DOM/touch events) with live progress heartbeats."""
     await asyncio.sleep(random.uniform(min_delay, max_delay))
 
     if export_cb and req_counter > 0 and req_counter % 3 == 0:
@@ -296,8 +296,23 @@ async def polite_sleep(
         rest_s = random.uniform(wave_rest_sec * 0.95, wave_rest_sec * 1.1)
         if export_cb:
             export_cb()
-        print(f"  [Wave Rest] Completed {req_counter - 1} requests -> pausing {rest_s/60:.1f} mins to keep request frequency low...", flush=True)
-        await asyncio.sleep(rest_s)
+        now_str = time.strftime('%H:%M:%S')
+        print(
+            f"⏳ [休眠保护 {now_str}] 已稳妥完成 {req_counter - 1} 次请求，进入 {rest_s/60:.1f} 分钟波次深休（保护单号安全，约 5 分钟后刷新休眠进度）...",
+            flush=True,
+        )
+        if heartbeat_cb:
+            heartbeat_cb(note=f"波次深休中(共{rest_s/60:.1f}m)")
+        half_s = rest_s / 2.0
+        await asyncio.sleep(half_s)
+        mid_str = time.strftime('%H:%M:%S')
+        print(
+            f"⏳ [休眠进度 {mid_str}] 波次保护休眠已过半，剩余约 {(rest_s - half_s)/60:.1f} 分钟后自动恢复采集...",
+            flush=True,
+        )
+        if heartbeat_cb:
+            heartbeat_cb(note=f"波次深休剩余{(rest_s - half_s)/60:.1f}m")
+        await asyncio.sleep(rest_s - half_s)
 
     ep_list = SPUTAG_TIMESTAMPS if endpoint == 'sputag_p0' else SMOOTH_TIMESTAMPS
     ep_cap = min(55, int(hourly_cap))
@@ -560,15 +575,59 @@ async def run_crawler(args):
                 out_f.flush()
             return added
 
-        def save_progress(phase, step_num, total_steps, idx, name):
+        def current_sku_row_count():
+            return sum(max(1, len(s.get('skus') or [])) for s in seen_spus.values())
+
+        PHASE_CN = {
+            'Pass1_L1_mem': '一级分类内存读取',
+            'Pass1_L1_p0': '一级分类扫描(1号门)',
+            'Pass_L2_p0': '二级子分类收割(1号门)',
+            'Pass1.5_smoothRender': '批量翻页收割(2号门)',
+            'DONE': '全量采集完成',
+            'PARTIAL_BY_DAILY_CAP': '已达单号24h安全上限停机',
+        }
+        last_phase_info = {'phase': 'Pass1_L1_p0', 'step': 0, 'total': 0, 'idx': -1, 'name': '初始化'}
+
+        def calc_run_eta_minutes(phase):
+            rem_spu_24h = max(0, args.max_sputag_daily - quota_ledger.count_24h('sputag'))
+            rem_sm_24h = max(0, args.max_smooth_daily - quota_ledger.count_24h('smooth'))
+            if phase in ('DONE', 'PARTIAL_BY_DAILY_CAP'):
+                return 0.0
+            rem_l1 = sum(1 for t in ordered_tabs if str(t['idx']) not in cat_map or not cat_map[str(t['idx'])].get('allSortedSpuId'))
+            sm_need = compute_remaining_smooth_batches(ordered_tabs, cat_map, seen_spus, unfetchable_ids) if cat_map else 0
+            planned_sputag = min(rem_spu_24h, rem_l1 + (max(0, rem_spu_24h - rem_l1) if sm_need > rem_sm_24h else 0))
+            planned_smooth = min(rem_sm_24h, sm_need)
+            return round(estimate_eta_minutes(planned_sputag + planned_smooth, args.min_delay, args.max_delay, args.wave_size, args.wave_rest_sec), 1)
+
+        def save_progress(phase, step_num, total_steps, idx, name, note='', emit_banner=False):
+            last_phase_info.update(phase=phase, step=step_num, total=total_steps, idx=idx, name=name)
             all_discovered = {
                 int(sid)
                 for v_cat in cat_map.values()
                 for sid in (v_cat.get('allSortedSpuId') or [])
             }
+            tot_disc = len(all_discovered)
+            coll = len(seen_spus)
+            sku_rows = current_sku_row_count()
+            pct = round(coll / tot_disc * 100.0, 1) if tot_disc > 0 else 0.0
+            spu_used = quota_ledger.count_24h('sputag')
+            sm_used = quota_ledger.count_24h('smooth')
+            eta_m = calc_run_eta_minutes(phase)
+            now_ts = time.time()
+            now_hm = time.strftime('%H:%M:%S', time.localtime(now_ts))
+            phase_label = PHASE_CN.get(phase, phase)
+            status_line = (
+                f"📊 [实时进度 {now_hm}] {actual_poi_name} | 阶段: {phase_label} ({name})"
+                + (f" [{note}]" if note else "")
+                + f" | 已采: {coll}/{tot_disc or '?'} 款SPU ({pct:.1f}%, 展开 {sku_rows} 行SKU)"
+                + f" | 24h配额: 1号门 {spu_used}/{args.max_sputag_daily} · 2号门 {sm_used}/{args.max_smooth_daily}"
+                + f" | 本轮预计剩余: ~{eta_m:.0f} 分钟"
+            )
             with open(progress_json, 'w', encoding='utf-8') as pf:
                 json.dump({
                     'phase': phase,
+                    'phase_cn': phase_label,
+                    'note': note,
                     'poi_id_str': store_lock['locked_poi_id_str'],
                     'poi_name': actual_poi_name,
                     'poi_address': actual_poi_addr,
@@ -577,11 +636,22 @@ async def run_crawler(args):
                     'total_steps': total_steps,
                     'current_l1_idx': idx,
                     'current_l1_name': name,
-                    'unique_spus_collected': len(seen_spus),
-                    'total_discovered_ids': len(all_discovered),
+                    'unique_spus_collected': coll,
+                    'exported_sku_rows': sku_rows,
+                    'total_discovered_ids': tot_disc,
+                    'completion_pct': pct,
                     'requests_made': req_counter,
-                    'timestamp': time.time(),
+                    'sputag_24h_used': spu_used,
+                    'sputag_24h_cap': args.max_sputag_daily,
+                    'smooth_24h_used': sm_used,
+                    'smooth_24h_cap': args.max_smooth_daily,
+                    'eta_minutes_this_run': eta_m,
+                    'updated_at_human': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now_ts)),
+                    'status_line': status_line,
+                    'timestamp': now_ts,
                 }, pf, ensure_ascii=False, indent=2)
+            if emit_banner or (req_counter > 0 and req_counter % 4 == 0):
+                print(status_line, flush=True)
 
         # Harvest initial SPUs already in Redux memory (0 network requests)
         msg_seq += 1
@@ -659,7 +729,19 @@ async def run_crawler(args):
                 if shifted:
                     print(f"[Category Realign] Detected store shelf tab shift; auto-realigned {len(cat_map)} saved categories by tag ID.", flush=True)
 
+        def on_wave_heartbeat(note=''):
+            save_progress(
+                last_phase_info['phase'],
+                last_phase_info['step'],
+                last_phase_info['total'],
+                last_phase_info['idx'],
+                last_phase_info['name'],
+                note=note,
+                emit_banner=True,
+            )
+
         pacing_kw = dict(
+            heartbeat_cb=on_wave_heartbeat,
             min_delay=args.min_delay,
             max_delay=args.max_delay,
             hourly_cap=args.hourly_cap,
@@ -948,15 +1030,50 @@ async def run_crawler(args):
         all_discovered_ids = {int(sid) for v_cat in cat_map.values() for sid in (v_cat.get('allSortedSpuId') or [])}
         missing_final = len([sid for sid in all_discovered_ids if sid not in seen_spus and sid not in unfetchable_ids])
         if missing_final > 0 and (smooth_capped or quota_ledger.count_24h('sputag') >= args.max_sputag_daily):
+            save_progress('PARTIAL_BY_DAILY_CAP', len(ordered_tabs), len(ordered_tabs), -1, '本轮配额已满', emit_banner=True)
             print(
                 f"[PARTIAL_BY_DAILY_CAP] {actual_poi_name}: safely collected {len(seen_spus)} unique SPUs "
                 f"(remaining={missing_final}) within 24h single-account soft cap. Resume with same command tomorrow after 24h quota refreshes.",
                 flush=True,
             )
             sys.exit(44)
+        save_progress('DONE', len(ordered_tabs), len(ordered_tabs), -1, '全店完成', emit_banner=True)
         print(
             f"[DONE] {actual_poi_name}: collected {len(seen_spus)} unique SPUs "
             f"(remaining={missing_final}) in {req_counter} requests.",
+            flush=True,
+        )
+
+
+def print_live_status(out_dir=None):
+    """Print human-readable live status from `progress.json` (0 network requests)."""
+    cand_files = []
+    if out_dir:
+        p = os.path.join(out_dir, 'progress.json')
+        if os.path.exists(p):
+            cand_files.append(p)
+    else:
+        base = os.path.join('.', 'crawl_data')
+        if os.path.isdir(base):
+            for name in os.listdir(base):
+                p = os.path.join(base, name, 'progress.json')
+                if os.path.exists(p):
+                    cand_files.append(p)
+    if not cand_files:
+        print('[Status] No progress.json found yet (Specify --out-dir if stored elsewhere).', flush=True)
+        return
+    latest_p = max(cand_files, key=os.path.getmtime)
+    prog = json.load(open(latest_p, 'r', encoding='utf-8'))
+    age_s = max(0, int(time.time() - float(prog.get('timestamp') or 0)))
+    if prog.get('status_line'):
+        print(f"{prog['status_line']} (最后刷新: {age_s}秒前)", flush=True)
+    else:
+        coll = prog.get('unique_spus_collected', 0)
+        tot = prog.get('total_discovered_ids', 0)
+        pct = (coll / tot * 100.0) if tot else 0.0
+        print(
+            f"📊 [实时进度] {prog.get('poi_name', '')} | 阶段: {prog.get('phase', '')} ({prog.get('current_l1_name', '')}) "
+            f"| 已采: {coll}/{tot or '?'} 款SPU ({pct:.1f}%) | 本轮请求: {prog.get('requests_made', 0)} 次 (最后刷新: {age_s}秒前)",
             flush=True,
         )
 
@@ -1014,6 +1131,7 @@ def main():
     parser = argparse.ArgumentParser(description='Meituan H5 Store Catalog Collector (Mandatory Slow-Sleep Edition)')
     parser.add_argument('--port', type=int, default=9222, help='Chrome remote debugging port (default: 9222)')
     parser.add_argument('--inspect-only', action='store_true', help='Only inspect open Meituan H5 store tab and exit')
+    parser.add_argument('--status', action='store_true', help='Print formatted live progress summary from progress.json (0 network calls) and exit')
     parser.add_argument('--account-tier', choices=('veteran', 'conservative'), default='veteran',
                         help="'veteran' (default: >=68~88s, <=38/h, <=92/85 24h caps) or 'conservative' for newer accounts (>=75~95s, <=32/h, <=28/35 24h caps)")
     parser.add_argument('--poi-id-str', type=str, default=None, help='Optional expected poi_id_str (auto-detected from open store tab if omitted)')
@@ -1030,6 +1148,9 @@ def main():
     parser.add_argument('--max-sputag-daily', type=int, default=None, help='24h cap for spuTagProducts (0..92 veteran / 0..28 conservative; 0 skips sputag)')
     parser.add_argument('--max-smooth-daily', type=int, default=None, help='24h cap for requestSmoothSpus (0..85 veteran / 0..35 conservative; 0 skips smooth)')
     args = parser.parse_args()
+    if args.status:
+        print_live_status(args.out_dir)
+        return
 
     preset = ACCOUNT_TIER_PRESETS[args.account_tier]
     enforce_mandatory_pacing_bounds(args, preset)
