@@ -1,4 +1,4 @@
 interface:
   display_name: "美团闪购竞对全量采集与比价引擎 (meituanjingdui)"
-  short_description: "采集美团闪购门店商品、价格和库存，按 SKU 导出 27 列比价表"
-  default_prompt: "请使用 $meituanjingdui 核对目标美团闪购分店，采集商品并导出 27 列 Excel 比价表。"
+  short_description: "强制慢速休眠(68~88s/≤38次每小时/满30休10m)单号安全采集美团闪购商品并导出27列比价表与分析报告"
+  default_prompt: "请严格遵守 $meituanjingdui 的强制慢速休眠与单号24h配额铁律（严禁自写快速脚本或调快间隔），核对目标美团闪购分店，调用官方脚本慢速采集商品并导出27列Excel比价表与数据分析报告。"

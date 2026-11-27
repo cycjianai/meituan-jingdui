@@ -605,6 +605,47 @@ async def run_crawler(args):
             (entity_tabs if kind == 'entity' else promo_tabs).append(m)
         ordered_tabs = entity_tabs + promo_tabs
 
+        # Auto-realign saved cat_map by normalized `tag` in case the store dynamically inserted/reordered L1 tabs
+        if cat_map:
+            saved_by_tag = {
+                str(v.get('tag') or '').replace('_27', ''): v
+                for v in cat_map.values()
+                if isinstance(v, dict) and v.get('tag')
+            }
+            realigned_map = {}
+            shifted = False
+            for m in ordered_tabs:
+                norm_t = str(m.get('tag') or '').replace('_27', '')
+                prior_c = saved_by_tag.get(norm_t)
+                if not prior_c or not prior_c.get('allSortedSpuId'):
+                    continue
+                if str(prior_c.get('idx')) != str(m['idx']):
+                    shifted = True
+                old_subs_by_tag = {str(s.get('tag')): s for s in (prior_c.get('sub_tags') or []) if isinstance(s, dict)}
+                aligned_subs = []
+                for live_st in (m.get('sub_tags') or []):
+                    prev_st = old_subs_by_tag.get(str(live_st.get('tag')), {})
+                    st_entry = {'tag': live_st.get('tag'), 'name': live_st.get('name')}
+                    if prev_st.get('allSortedSpuId'):
+                        st_entry['allSortedSpuId'] = prev_st['allSortedSpuId']
+                    aligned_subs.append(st_entry)
+                realigned_map[str(m['idx'])] = {
+                    'idx': m['idx'],
+                    'name': m['name'],
+                    'tag': prior_c.get('tag', m['tag']),
+                    'type': prior_c.get('type', m.get('type', 1)),
+                    'is_promo': bool(m.get('_is_promo')),
+                    'sub_idx': 0 if m['hasSub'] else -1,
+                    'sub_tags': aligned_subs,
+                    'allSortedSpuId': prior_c['allSortedSpuId'],
+                }
+            if shifted or len(realigned_map) != len(cat_map):
+                cat_map = realigned_map
+                with open(cat_map_json, 'w', encoding='utf-8') as cf:
+                    json.dump(cat_map, cf, ensure_ascii=False, indent=2)
+                if shifted:
+                    print(f"[Category Realign] Detected store shelf tab shift; auto-realigned {len(cat_map)} saved categories by tag ID.", flush=True)
+
         pacing_kw = dict(
             min_delay=args.min_delay,
             max_delay=args.max_delay,
@@ -655,7 +696,7 @@ async def run_crawler(args):
                 print(f"[Pass1 {step_num}/{len(ordered_tabs)}] Cat[{idx}] {name}: {len(mem_cat['allSortedSpuId'])} IDs in memory (+{added_mem} SPUs, 0 reqs)", flush=True)
                 continue
 
-            if args.max_sputag_daily > 0 and quota_ledger.count_24h('sputag') >= args.max_sputag_daily:
+            if quota_ledger.count_24h('sputag') >= args.max_sputag_daily:
                 print(f"[DAILY_QUOTA_GUARD] spuTagProducts reached 24h soft cap ({quota_ledger.count_24h('sputag')}/{args.max_sputag_daily}). Saving Excel & report and stopping cleanly.", flush=True)
                 export_current_excel(run_analysis=True)
                 out_f.close()
@@ -671,12 +712,13 @@ async def run_crawler(args):
             (async () => {{
                 const p = getCurrentPages()[0];
                 const c = p._getCachedData({idx}, {sub_idx});
+                if (!c) return {{allSortedSpuId: [], spus: []}};
                 try {{
                     await p.requestSpusAndSortedIds({idx}, {sub_idx}, c.tag, c.type, 0, true);
                 }} catch (err) {{
                     return {{error: String(err.message || err)}};
                 }}
-                const c2 = p._getCachedData({idx}, {sub_idx});
+                const c2 = p._getCachedData({idx}, {sub_idx}) || c;
                 return {{
                     tag: c2.tag,
                     type: c2.type,
@@ -738,7 +780,7 @@ async def run_crawler(args):
                         if cur_sm_need <= max(0, rem_sm_cap - 2):
                             print(f"[Smart Planner] Remaining smoothRender batches ({cur_sm_need}) now fit safely within 24h smooth quota ({rem_sm_cap}) -> switching to smoothRender sweep!", flush=True)
                             return
-                    if args.max_sputag_daily > 0 and quota_ledger.count_24h('sputag') >= args.max_sputag_daily:
+                    if quota_ledger.count_24h('sputag') >= args.max_sputag_daily:
                         print(f"[DAILY_QUOTA_GUARD] spuTagProducts reached 24h soft cap ({quota_ledger.count_24h('sputag')}/{args.max_sputag_daily}).", flush=True)
                         return
 
@@ -753,15 +795,18 @@ async def run_crawler(args):
                     (async () => {{
                         const p = getCurrentPages()[0];
                         const c = p._getCachedData({idx}, {s_idx});
+                        if (!c) return {{skip_missing_slot: true, allSortedSpuId: [], spus: []}};
                         try {{
                             await p.requestSpusAndSortedIds({idx}, {s_idx}, c.tag, c.type, 0, true);
                         }} catch (err) {{
                             return {{error: String(err.message || err)}};
                         }}
-                        const c2 = p._getCachedData({idx}, {s_idx});
+                        const c2 = p._getCachedData({idx}, {s_idx}) || c;
                         return {{allSortedSpuId: c2.allSortedSpuId || [], spus: c2.spus || []}};
                     }})()
                     ''')
+                    if res and res.get('skip_missing_slot'):
+                        continue
                     if res and res.get('error'):
                         handle_stop_error(f"L2 Cat[{idx}] Sub[{s_idx}] {st_name}", str(res['error']))
 
@@ -773,8 +818,8 @@ async def run_crawler(args):
                     print(f"  -> [L2 p=0] Cat[{idx}] {name} / Sub[{s_idx}] {st_name}: +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
 
         needed_smooth = compute_remaining_smooth_batches(ordered_tabs, cat_map, seen_spus, unfetchable_ids)
-        rem_smooth_24h = max(0, args.max_smooth_daily - quota_ledger.count_24h('smooth')) if args.max_smooth_daily > 0 else 999999
-        rem_sputag_24h = max(0, args.max_sputag_daily - quota_ledger.count_24h('sputag')) if args.max_sputag_daily > 0 else 999999
+        rem_smooth_24h = max(0, args.max_smooth_daily - quota_ledger.count_24h('smooth'))
+        rem_sputag_24h = max(0, args.max_sputag_daily - quota_ledger.count_24h('sputag'))
         all_l1_ids = {int(sid) for v_cat in cat_map.values() for sid in (v_cat.get('allSortedSpuId') or [])}
         eta_m = estimate_eta_minutes(needed_smooth, args.min_delay, args.max_delay, args.wave_size, args.wave_rest_sec)
         print(
@@ -783,7 +828,7 @@ async def run_crawler(args):
             flush=True,
         )
 
-        if args.max_smooth_daily > 0 and needed_smooth > rem_smooth_24h and rem_sputag_24h > 0:
+        if needed_smooth > rem_smooth_24h and rem_sputag_24h > 0:
             print(
                 f"[Smart Planner] Store needs {needed_smooth} smooth batches > {rem_smooth_24h} remaining smooth quota; "
                 f"using up to {rem_sputag_24h} remaining L2 p=0 calls FIRST on big categories so smooth quota covers tail categories!",
@@ -793,7 +838,7 @@ async def run_crawler(args):
             export_current_excel()
 
         # ==================== PASS 1.5: Smooth pagination batch=30 ====================
-        smooth_capped = bool(args.max_smooth_daily > 0 and quota_ledger.count_24h('smooth') >= args.max_smooth_daily)
+        smooth_capped = bool(quota_ledger.count_24h('smooth') >= args.max_smooth_daily)
         for step_num, m in enumerate(ordered_tabs, 1):
             if smooth_capped:
                 break
@@ -805,7 +850,7 @@ async def run_crawler(args):
                 continue
 
             while not smooth_capped:
-                if args.max_smooth_daily > 0 and quota_ledger.count_24h('smooth') >= args.max_smooth_daily:
+                if quota_ledger.count_24h('smooth') >= args.max_smooth_daily:
                     print(f"[DAILY_QUOTA_GUARD] smoothRender reached 24h soft cap ({quota_ledger.count_24h('smooth')}/{args.max_smooth_daily}).", flush=True)
                     smooth_capped = True
                     break
@@ -823,13 +868,14 @@ async def run_crawler(args):
                 (async () => {{
                     const p = getCurrentPages()[0];
                     const c = p._getCachedData({idx}, {sub_idx});
+                    if (!c) return {{spus: []}};
                     if (!Array.isArray(c.allSortedSpuId) || !c.allSortedSpuId.length) {{
                         c.allSortedSpuId = {json.dumps(all_ids)};
                     }}
                     const targetIds = {json.dumps(batch)};
                     try {{
                         await p.requestSmoothSpus(targetIds, {idx}, {sub_idx}, c.tag, c.type, {{}});
-                        const c2 = p._getCachedData({idx}, {sub_idx});
+                        const c2 = p._getCachedData({idx}, {sub_idx}) || c;
                         const idSet = new Set(targetIds.map(Number));
                         return {{spus: (c2.spus || []).filter(s => s && idSet.has(Number(s.id)))}};
                     }} catch (err) {{
@@ -857,14 +903,14 @@ async def run_crawler(args):
                     print(f"  -> Cat[{idx}] {name} [batch={len(batch)}, cat_rem={rem_after}]: +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
 
         # If smooth hit soft cap and sputag still has 24h allowance, run remaining L2 sub-categories
-        if smooth_capped and (args.max_sputag_daily <= 0 or quota_ledger.count_24h('sputag') < args.max_sputag_daily):
+        if smooth_capped and quota_ledger.count_24h('sputag') < args.max_sputag_daily:
             await run_l2_pass(stop_when_smooth_fits=False)
 
         export_current_excel(run_analysis=True)
         out_f.close()
         all_discovered_ids = {int(sid) for v_cat in cat_map.values() for sid in (v_cat.get('allSortedSpuId') or [])}
         missing_final = len([sid for sid in all_discovered_ids if sid not in seen_spus and sid not in unfetchable_ids])
-        if missing_final > 0 and (smooth_capped or (args.max_sputag_daily > 0 and quota_ledger.count_24h('sputag') >= args.max_sputag_daily)):
+        if missing_final > 0 and (smooth_capped or quota_ledger.count_24h('sputag') >= args.max_sputag_daily):
             print(
                 f"[PARTIAL_BY_DAILY_CAP] {actual_poi_name}: safely collected {len(seen_spus)} unique SPUs "
                 f"(remaining={missing_final}) within 24h single-account soft cap. Resume with same command tomorrow after 24h quota refreshes.",
@@ -878,42 +924,78 @@ async def run_crawler(args):
         )
 
 
+def enforce_mandatory_pacing_bounds(args, preset):
+    """
+    Hard-lock mandatory slow-sleep floors and 24h quota ceilings in code so NO caller or Agent
+    can accidentally override CLI arguments to run faster than the Skill's safe rate limits.
+    """
+    clamped = []
+
+    raw_min = preset['min_delay'] if args.min_delay is None else float(args.min_delay)
+    if raw_min < preset['min_delay']:
+        clamped.append(f"min_delay {raw_min}s -> {preset['min_delay']}s")
+    args.min_delay = max(preset['min_delay'], raw_min)
+
+    raw_max = preset['max_delay'] if args.max_delay is None else float(args.max_delay)
+    floor_max = max(preset['max_delay'], args.min_delay + 10.0)
+    if raw_max < floor_max:
+        clamped.append(f"max_delay {raw_max}s -> {floor_max}s")
+    args.max_delay = max(floor_max, raw_max)
+
+    raw_hcap = preset['hourly_cap'] if args.hourly_cap is None else int(args.hourly_cap)
+    if raw_hcap <= 0 or raw_hcap > preset['hourly_cap']:
+        clamped.append(f"hourly_cap {raw_hcap} -> {preset['hourly_cap']}")
+    args.hourly_cap = preset['hourly_cap'] if raw_hcap <= 0 else min(preset['hourly_cap'], raw_hcap)
+
+    raw_wsize = preset['wave_size'] if args.wave_size is None else int(args.wave_size)
+    if raw_wsize <= 0 or raw_wsize > preset['wave_size']:
+        clamped.append(f"wave_size {raw_wsize} -> {preset['wave_size']}")
+    args.wave_size = preset['wave_size'] if raw_wsize <= 0 else min(preset['wave_size'], raw_wsize)
+
+    raw_wrest = preset['wave_rest_sec'] if args.wave_rest_sec is None else float(args.wave_rest_sec)
+    if raw_wrest < preset['wave_rest_sec']:
+        clamped.append(f"wave_rest_sec {raw_wrest}s -> {preset['wave_rest_sec']}s")
+    args.wave_rest_sec = max(preset['wave_rest_sec'], raw_wrest)
+
+    raw_spu_cap = preset['max_sputag_24h'] if args.max_sputag_daily is None else int(args.max_sputag_daily)
+    final_spu_cap = min(preset['max_sputag_24h'], max(0, raw_spu_cap))
+    if final_spu_cap != raw_spu_cap:
+        clamped.append(f"max_sputag_daily {raw_spu_cap} -> {final_spu_cap}")
+    args.max_sputag_daily = final_spu_cap
+
+    raw_sm_cap = preset['max_smooth_24h'] if args.max_smooth_daily is None else int(args.max_smooth_daily)
+    final_sm_cap = min(preset['max_smooth_24h'], max(0, raw_sm_cap))
+    if final_sm_cap != raw_sm_cap:
+        clamped.append(f"max_smooth_daily {raw_sm_cap} -> {final_sm_cap}")
+    args.max_smooth_daily = final_sm_cap
+
+    if clamped:
+        print(f"[MANDATORY_PACING_CLAMP] Enforced mandatory slow-sleep bounds: {', '.join(clamped)}", flush=True)
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Meituan H5 Store Catalog Collector (Compliant Effortless Edition)')
+    parser = argparse.ArgumentParser(description='Meituan H5 Store Catalog Collector (Mandatory Slow-Sleep Edition)')
     parser.add_argument('--port', type=int, default=9222, help='Chrome remote debugging port (default: 9222)')
     parser.add_argument('--inspect-only', action='store_true', help='Only inspect open Meituan H5 store tab and exit')
     parser.add_argument('--account-tier', choices=('veteran', 'conservative'), default='veteran',
-                        help="'veteran' (default: 68~88s, <=38/h, 92/85 24h caps) or 'conservative' for newer/low-activity accounts (75~95s, <=32/h, 28/35 24h caps)")
+                        help="'veteran' (default: >=68~88s, <=38/h, <=92/85 24h caps) or 'conservative' for newer accounts (>=75~95s, <=32/h, <=28/35 24h caps)")
     parser.add_argument('--poi-id-str', type=str, default=None, help='Optional expected poi_id_str (auto-detected from open store tab if omitted)')
     parser.add_argument('--poi-name', type=str, default=None, help='Optional expected store name substring (auto-detected if omitted)')
     parser.add_argument('--out-dir', type=str, default=None, help='Directory for checkpoint files (defaults to ./crawl_data/{店铺名称})')
     parser.add_argument('--excel-out-dir', type=str, default='.', help='Directory for exported {MMDD}{店铺名称}.xlsx (default: current dir)')
     parser.add_argument('--date-mmdd', type=str, default=None, help='Optional MMDD override for Excel filename (sticky across midnight)')
     parser.add_argument('--no-report', action='store_true', help='Skip auto-generating {MMDD}{店铺名称}_数据分析报告.md')
-    parser.add_argument('--min-delay', type=float, default=None, help='Override minimum delay between requests in seconds')
-    parser.add_argument('--max-delay', type=float, default=None, help='Override maximum delay between requests in seconds')
-    parser.add_argument('--hourly-cap', type=int, default=None, help='Override max requests per 62-minute window')
-    parser.add_argument('--wave-size', type=int, default=None, help='Override requests per wave before deep pause')
-    parser.add_argument('--wave-rest-sec', type=float, default=None, help='Override deep pause duration in seconds')
-    parser.add_argument('--max-sputag-daily', type=int, default=None, help='Override 24h soft cap for spuTagProducts(p=0)')
-    parser.add_argument('--max-smooth-daily', type=int, default=None, help='Override 24h soft cap for requestSmoothSpus(batch=30)')
+    parser.add_argument('--min-delay', type=float, default=None, help='Minimum delay in seconds (hard-clamped >= 68s veteran / >= 75s conservative)')
+    parser.add_argument('--max-delay', type=float, default=None, help='Maximum delay in seconds (hard-clamped >= 88s veteran / >= 95s conservative)')
+    parser.add_argument('--hourly-cap', type=int, default=None, help='Max requests per 62-minute window (hard-clamped <= 38 veteran / <= 32 conservative)')
+    parser.add_argument('--wave-size', type=int, default=None, help='Requests per wave before deep pause (hard-clamped <= 30 veteran / <= 25 conservative)')
+    parser.add_argument('--wave-rest-sec', type=float, default=None, help='Deep pause duration in seconds (hard-clamped >= 600s veteran / >= 660s conservative)')
+    parser.add_argument('--max-sputag-daily', type=int, default=None, help='24h cap for spuTagProducts (0..92 veteran / 0..28 conservative; 0 skips sputag)')
+    parser.add_argument('--max-smooth-daily', type=int, default=None, help='24h cap for requestSmoothSpus (0..85 veteran / 0..35 conservative; 0 skips smooth)')
     args = parser.parse_args()
 
     preset = ACCOUNT_TIER_PRESETS[args.account_tier]
-    if args.min_delay is None:
-        args.min_delay = preset['min_delay']
-    if args.max_delay is None:
-        args.max_delay = preset['max_delay']
-    if args.hourly_cap is None:
-        args.hourly_cap = preset['hourly_cap']
-    if args.wave_size is None:
-        args.wave_size = preset['wave_size']
-    if args.wave_rest_sec is None:
-        args.wave_rest_sec = preset['wave_rest_sec']
-    if args.max_sputag_daily is None:
-        args.max_sputag_daily = preset['max_sputag_24h']
-    if args.max_smooth_daily is None:
-        args.max_smooth_daily = preset['max_smooth_24h']
+    enforce_mandatory_pacing_bounds(args, preset)
 
     asyncio.run(run_crawler(args))
 

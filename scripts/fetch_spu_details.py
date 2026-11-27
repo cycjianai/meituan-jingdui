@@ -303,9 +303,20 @@ def main():
     parser.add_argument('--out-xlsx', required=True, help='Output Excel path for new-product assembly')
     parser.add_argument('--download-images-dir', default='', help='Optional directory to download images')
     parser.add_argument('--port', type=int, default=9222, help='Chrome remote debugging port')
-    parser.add_argument('--min-delay', type=float, default=20.0, help='Minimum delay between requests in seconds (default: 20)')
-    parser.add_argument('--max-delay', type=float, default=30.0, help='Maximum delay between requests in seconds (default: 30)')
+    parser.add_argument('--min-delay', type=float, default=25.0, help='Minimum delay between requests in seconds (hard-clamped >= 25)')
+    parser.add_argument('--max-delay', type=float, default=35.0, help='Maximum delay between requests in seconds (hard-clamped >= 35)')
+    parser.add_argument('--max-details-daily', type=int, default=60, help='Max single-product detail requests per run/day (hard-clamped <= 60)')
     args = parser.parse_args()
+
+    # Hard-lock mandatory slow-sleep bounds in code
+    if args.min_delay < 25.0:
+        print(f"[MANDATORY_PACING_CLAMP] Clamped min_delay {args.min_delay}s -> 25.0s", flush=True)
+        args.min_delay = 25.0
+    if args.max_delay < max(35.0, args.min_delay + 8.0):
+        floor_m = max(35.0, args.min_delay + 8.0)
+        print(f"[MANDATORY_PACING_CLAMP] Clamped max_delay {args.max_delay}s -> {floor_m}s", flush=True)
+        args.max_delay = floor_m
+    args.max_details_daily = min(60, max(1, int(args.max_details_daily)))
 
     spu_lookup = {}
     if args.spus_jsonl and os.path.exists(args.spus_jsonl):
@@ -334,12 +345,18 @@ def main():
 
     save_cb = lambda: export_details_excel(args.out_jsonl, args.out_xlsx)
     client = StoreDetailClient(port=args.port, min_delay=args.min_delay, max_delay=args.max_delay)
+    fetched_this_run = 0
     for idx, sid in enumerate(target_ids, 1):
         if sid in done_ids:
             print(f'[{idx}/{len(target_ids)}] SPU {sid} already fetched, skipping.', flush=True)
             continue
+        if fetched_this_run >= args.max_details_daily:
+            print(f'[DAILY_QUOTA_GUARD] Reached single-run detail soft cap ({fetched_this_run}/{args.max_details_daily}). Saving and stopping cleanly.', flush=True)
+            save_cb()
+            sys.exit(44)
         fb = spu_lookup.get(sid) or {}
         res = client.fetch_one_spu_detail(sid, spu_tag=fb.get('tag', ''), activity_tag=fb.get('activity_tag', ''), on_stop=save_cb)
+        fetched_this_run += 1
         err_msg = str((res or {}).get('msg') or '')
         if '418' in err_msg or 'verify' in err_msg.lower():
             print(f'[STOP_ON_VERIFY] productInfoV2 hit verification challenge ({err_msg}) on SPU {sid}. Saving and halting.', flush=True)

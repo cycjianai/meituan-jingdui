@@ -1,27 +1,48 @@
 ---
 name: meituanjingdui
-description: 通过用户本机已登录常规 Chrome 的美团外卖 H5 门店页（h5.waimai.meituan.com -> cactivityapi-sc.waimai.meituan.com），以单账号低频礼貌配速采集闪购/超市便利/闪电仓门店商品与 SKU 数据，自动导出锁定的 27 列 `{MMDD}{店铺名称}.xlsx` 比价表与离线 `{MMDD}{店铺名称}_数据分析报告.md`（支持跨零点防分裂、滚动 24h 配额保护、老号/新号分档、大店单号智能二级分类配额规划、69 码本店同品比价与缺品选品，以及按需提取新品副图/详情长图/属性表）。
+description: 通过用户本机已登录常规 Chrome 的美团外卖 H5 门店页（h5.waimai.meituan.com -> cactivityapi-sc.waimai.meituan.com），强制执行慢速休眠配速（68~88s/次、≤38次/小时、满30次休10分钟、滚动24h上限92/85）采集闪购/超市便利/闪电仓门店全量商品与 SKU 数据，自动导出锁定 27 列 `{MMDD}{店铺名称}.xlsx` 比价表与 `{MMDD}{店铺名称}_数据分析报告.md`（支持跨零点防分裂、动态分类位移自愈、老号/新号分档、大店单号智能二级分类配额规划、69 码同品比价与按需提取新品详情图）。
 ---
 
-# 美团闪购竞对采集、比价与货盘分析（合规省力版）
+# 美团闪购竞对采集、比价与货盘分析（强制慢速休眠版）
 
-## 核心原则与内置省力防坑能力
+## 【最高优先级强制红线】慢速休眠与单号配额铁律（每次执行 100% 强制遵守）
 
-1. **合规底线（零反爬伪造、受阻即停）**：
-   - 仅读取用户在常规 Chrome（默认调试端口 `9222`）自行登录并打开的目标门店页；不注入模拟触摸/鼠标轨迹、不修改 Cookie/设备指纹、不自动换号轮换。
-   - 遇到验证页面（`verify.meituan.com` / `418`）立即保存当前 Excel 与分析报告并以退出码 `42` 停机；遇到访问限制（`HTTP 403 / 406`）立即保存并以退出码 `43` 停机。
-2. **六大实战省力与防坑固化（默认全自动生效）**：
-   - **极简一行启动**：自动识别 `9222` 当前打开的门店名称、地址与 `poi_id_str`，未传 `--out-dir` 时自动创建 `./crawl_data/{店铺名称}` 独立断点目录。
-   - **老号 / 新号分档保护（`--account-tier`）**：默认 `veteran`（老号：`68~88s` 间隔、`≤38次/小时`、满 30 次休眠 `10 分钟`、24h 软上限 `92 / 85`）；若使用刚注册或低活跃新号，传 `--account-tier conservative`（`75~95s`、`≤32次/小时`、24h 软上限 `28 / 35`），防止新号低阈值过早受限。
-   - **滚动 24 小时配额账本（防跨零点超额）**：`daily_quota.json` 按真实滚动 `24 小时（86400秒）` 窗口统计调用次数，夜间跨过 `00:00` 不会误清零配额导致超发锁号。
-   - **跨零点 / 隔日续跑锁定同一份 Excel**：首次启动自动将日期 `MMDD` 固化进 `progress.json`，跨零点或次日断点续采始终更新同一份 `{MMDD}{店铺名称}.xlsx`，绝不分裂出两个日期文件。
-   - **页面重载后 `poi_id_str` 动态重加密自适应**：美团 H5 刷新或隔日重载后会对同一门店重新生成加密 `poi_id_str`；脚本自动校验 `店名 + 详细地址` 100% 一致后无感衔接新 ID，同时严防同名异店误爬。
-   - **大店（3,000~4,000 品）单号配额智能规划**：扫完一级分类后自动计算精确剩余批次数 $\sum \lceil \text{rem}_i / 30 \rceil$ 与完工 ETA；若超出剩余 `smooth` 额度，自动优先用剩余 `sputag` 额度点击高产二级子分类首屏分流大类，把 `smooth` 额度留给无子分类的尾部类目（如 `未分类`、`神价`），最大化单账号一次性采全率并提升第 8 列 `店内二级分类` 还原度。
-   - **完工/停机自动生成离线数据分析报告**：每次收尾自动调用 `scripts/analyze_competitor_store.py` 输出 `{MMDD}{店铺名称}_数据分析报告.md`。
+以下规则是保证**一个账号稳定跑出整店几千款商品最终成绩表、不触发网关封锁**的核心生命线，所有 AI Agent 每次执行时**必须无条件遵守，严禁变通或绕开**：
+
+1. **严禁自写快速循环或裸调页面接口**：
+   - 采集门店商品**必须且只能**调用本技能官方脚本 `scripts/crawl_h5_store.py`（二阶段单品详情只能调用 `scripts/fetch_spu_details.py`）。
+   - **绝对禁止**另写临时 Python/JS 脚本在后台循环裸调 `requestSpusAndSortedIds`、`requestSmoothSpus` 或 `productInfoV2`；除 `--inspect-only`（纯读页面内存、0 网络请求）外，**不允许脱离慢速休眠与 24h 配额账本发送任何试探请求**。
+2. **强制慢速休眠底线（已在代码层物理焊死，传参也无法调快）**：
+   - **老号档（`--account-tier veteran`，默认主力档）**：
+     - **单次间隔**：每次请求前**强制纯休眠 `68 ~ 88 秒`**（代码硬下限 `≥ 68s`，传入任何更小数值都会被代码强制拉回 `68s`）；
+     - **短时限流**：任意 `2 分钟（125 秒）` 内最多 `≤ 2~3 次`；
+     - **小时上限**：任意 `62 分钟` 滑动窗口硬锁 **`≤ 38 次`**；
+     - **波次深休**：每累计满 **`30 次`** 请求，**强制纯休眠 `10 分钟（600 秒）`**；
+     - **滚动 24h 单号配额硬上限**：1 号门分类接口 `sputag ≤ 92 次`、2 号门下拉翻页接口 `smooth ≤ 85 次`（两扇门合计 `177 次`，稳跑约 5~5.5 小时，单老号一天可稳采约 4,000~4,600 款 SPU / 7,000~8,000 行多规格 SKU）。
+   - **新号 / 低活跃号档（`--account-tier conservative`）**：
+     - 若用户使用的是新注册或低活跃账号，必须传 `--account-tier conservative`（强制 `75 ~ 95 秒` 间隔、`≤ 32 次/小时`、满 `25 次` 休眠 `11 分钟`、滚动 24h 上限 `sputag ≤ 28 / smooth ≤ 35`）。不确定账号新老时先向用户确认一句。
+3. **后台耐心长跑（严禁嫌慢改快）**：
+   - 大店采集天然耗时 **2.5 ~ 5.5 小时**。启动后台任务后静默等待系统完成通知即可，**严禁嫌慢去缩短休眠秒数或取消 10 分钟波次深休**（一旦过快把 2 号门 `smooth` 刷出网关 `403`，同浏览器/IP 24 小时内都无法再下拉翻页）。
+4. **合规底线与受阻即停（零反爬伪造）**：
+   - 仅读取用户在常规 Chrome（默认端口 `9222`）手动登录并打开的目标门店页；**绝不注入模拟触摸/鼠标轨迹、绝不擦除或改写 Cookie/设备指纹、绝不执行多账号轮换**。
+   - 遇到验证页面（`verify.meituan.com` / `418`）：立即保存当前 Excel 与分析报告并以**退出码 `42`** 停机报告用户；
+   - 遇到访问限制（`HTTP 403 / 406`）：立即保存并以**退出码 `43`** 停机，绝不轮询重试（若仅因早先遗留导致 2 号门 `smooth` 处于 `403` 冷却、而 1 号门 `sputag` 正常，可显式传 `--max-smooth-daily 0` 跳过 2 号门，仅在当日剩余 `sputag` 额度内慢速采集分类与二级子分类）；
+   - 触达滚动 24h 配额上限：自动保存并以**退出码 `44`** 优雅停机，待满 24 小时配额释放后用同一命令断点续采。
 
 ---
 
-## 1. 一键启动流程
+## 内置六大防坑机制（默认全自动生效）
+
+1. **极简一行启动**：自动识别 `9222` 当前门店名称、地址与 `poi_id_str`，未传 `--out-dir` 时自动创建 `./crawl_data/{店铺名称}` 独立断点目录。
+2. **代码级限速硬钳位（Hard Clamp）**：所有间隔、每小时上限、波次休眠与 24h 配额均在 `crawl_h5_store.py` / `fetch_spu_details.py` 入口做物理上下界钳位，杜绝误传快参数毁号。
+3. **滚动 24 小时配额账本（防跨零点超发）**：`daily_quota.json` 按真实 `86400 秒` 滚动窗口统计调用时间戳，跨过 `00:00` 不会误清零配额。
+4. **跨零点 / 隔日续跑锁定同一份 Excel**：首次启动自动将日期 `MMDD` 固化进 `progress.json`，隔日续采始终更新同一份 `{MMDD}{店铺名称}.xlsx`。
+5. **页面重载 `poi_id_str` 重加密与门店动态改分类自愈**：核验 `店名 + 详细地址` 100% 一致后自动衔接新加密 `poi_id_str`；若商家中途新增/调整分类导致下标偏移，自动按分类唯一 `tag` 重新对齐 `categories.json`，绝不中途崩断。
+6. **大店单号配额智能规划 + 自动出分析报告**：扫完一级分类后若剩余批次数超出 `smooth` 额度，自动优先用剩余 `sputag` 额度采集高产二级子分类首屏分流大类；收尾自动调用 `scripts/analyze_competitor_store.py` 输出 `{MMDD}{店铺名称}_数据分析报告.md`。
+
+---
+
+## 1. 标准启动流程
 
 ### Step 1：确认依赖与常规 Chrome 门店页
 ```bash
@@ -32,30 +53,30 @@ python3 -c "import websockets, openpyxl; print('DEPS_OK')" || python3 -m pip ins
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.chrome_meituan_9222" &
 ```
 
-### Step 2：核验当前门店（可选）
+### Step 2：纯内存核验当前门店（0 网络请求）
 ```bash
 python3 ~/.codex/skills/meituanjingdui/scripts/crawl_h5_store.py --port 9222 --inspect-only
 ```
 
-### Step 3：启动单账号省力采集（自动建断点目录 + 增量导出 27 列 Excel + 自动出分析报告）
+### Step 3：启动强制慢速采集（自动建断点目录 + 增量导出 27 列 Excel + 自动出分析报告）
 ```bash
-# 老号一键启动（自动锁定当前打开的门店，Excel 与分析报告输出到当前目录）
-python3 ~/.codex/skills/meituanjingdui/scripts/crawl_h5_store.py --port 9222 --excel-out-dir .
+# 活跃老号启动（强制 68~88s 间隔、≤38次/h、满30次休10m、24h上限 92/85）
+python3 -u ~/.codex/skills/meituanjingdui/scripts/crawl_h5_store.py --port 9222 --excel-out-dir .
 
-# 若使用新号/低活跃号，加 conservative 档位保护账号
-python3 ~/.codex/skills/meituanjingdui/scripts/crawl_h5_store.py --port 9222 --account-tier conservative --excel-out-dir .
+# 新号 / 低活跃号启动（强制 75~95s 间隔、≤32次/h、满25次休11m、24h上限 28/35）
+python3 -u ~/.codex/skills/meituanjingdui/scripts/crawl_h5_store.py --port 9222 --account-tier conservative --excel-out-dir .
 ```
-*(如需显式指定分店与目录，也可附带 `--poi-name`、`--poi-id-str`、`--out-dir`、`--date-mmdd`。)*
+*(如需显式指定分店与目录，可附带 `--poi-name`、`--poi-id-str`、`--out-dir`、`--date-mmdd`；若 2 号门 `smooth` 正处冷却期仅走 1 号门，可加 `--max-smooth-daily 0`。)*
 
 ---
 
 ## 2. 离线货盘分析与本店 69 码同品对标选品（0 网络请求）
 
-采集完成后会自动生成 `{MMDD}{店铺名称}_数据分析报告.md`。若你有本店导出的商品 Excel（含 69 条码列），可随时离线一键生成**同条码比价清单 + 竞对热销我方缺品 TOP 表**：
+采集收尾会自动生成 `{MMDD}{店铺名称}_数据分析报告.md`。若有本店商品 Excel（含 69 条码列），可随时离线生成**同条码比价清单 + 竞对热销我方缺品 TOP 表**：
 
 ```bash
 python3 ~/.codex/skills/meituanjingdui/scripts/analyze_competitor_store.py \
-  --excel "./1126快趣逛超市龙文店.xlsx" \
+  --excel "./1127快趣逛超市龙文店.xlsx" \
   --our-excel "./本店商品导出.xlsx"
 ```
 
@@ -84,10 +105,12 @@ python3 ~/.codex/skills/meituanjingdui/scripts/analyze_competitor_store.py \
 
 ---
 
-## 4. 二阶段按需提取新品轮播副图、详情长图与属性表
+## 4. 二阶段按需提取新品轮播副图、详情长图与属性表（强制慢速休眠）
+
+仅对筛选出的少量重点引进品按需执行（代码已强制 `≥25~35s/次`、`≤38次/小时`、24h 上限 `≤60次`）：
 
 ```bash
-python3 ~/.codex/skills/meituanjingdui/scripts/fetch_spu_details.py \
+python3 -u ~/.codex/skills/meituanjingdui/scripts/fetch_spu_details.py \
   --port 9222 \
   --spus-jsonl "./crawl_data/店铺名称/spus.jsonl" \
   --top-n-sales 30 \
