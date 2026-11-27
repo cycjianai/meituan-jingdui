@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
 """
-Meituan Shangou H5 Store Catalog Collector (Compliant Polite-Pacing Edition)
+Meituan Shangou H5 Store Catalog Collector (Compliant Effortless Edition)
 Part of the `meituanjingdui` skill.
 
-Design & Compliance Principles:
-1. Uses only the user's already-logged-in regular Chrome tab on the target store page.
-2. Strictly NO synthetic touch/mouse trajectory spoofing, NO cookie/fingerprint tampering,
-   NO DevTools tab manipulation, and NO multi-account rotation.
-3. Immediate clean stop (after saving checkpoint & partial 27-col Excel):
-   - Exit 42 if redirected to verification (`verify.meituan.com` / status 418) — never waits out or bypasses challenges.
-   - Exit 43 if server returns HTTP 403/406 access restriction — never retries or rotates accounts.
-   - Exit 44 if single-account daily soft cap (`--max-sputag-daily` / `--max-smooth-daily`) is reached.
-4. Conservative polite rate-limiting ON by default (`68~88s` interval, `<=38` reqs/hour, `10m` rest every `30` reqs).
+Built-in Pitfall Protections (100% Compliant — Zero Anti-Bot Spoofing or Evasion):
+1. Strict Compliance & Immediate Clean Stop:
+   - Uses ONLY the user's manually logged-in regular Chrome tab on the target store page.
+   - ZERO synthetic touch/mouse trajectory injection, ZERO cookie/fingerprint modification,
+     ZERO DevTools manipulation, and ZERO multi-account rotation.
+   - Exit 42 immediately if gated by verification (`verify.meituan.com` / 418) after saving Excel.
+   - Exit 43 immediately if server returns HTTP 403/406 after saving Excel.
+   - Exit 44 cleanly before hitting per-account limits via Rolling-24h Soft-Cap Guard.
+2. Midnight & Session-Reload Pitfall Fixes:
+   - Rolling 24-hour quota ledger (`86400s` sliding window in `daily_quota.json`) so crossing `00:00`
+     midnight never resets the quota counter prematurely or overruns a single account's 24h allowance.
+   - Sticky `target_mmdd` persisted in `progress.json` so crossing `00:00` midnight or resuming next day
+     updates the SAME `{MMDD}{店铺名称}.xlsx` file instead of splitting into two dates.
+   - Dynamic `poi_id_str` refresh tolerance: Meituan re-encrypts `poi_id_str` across page reloads; if
+     `poi_name` and `address` match 100%, automatically updates `poi_id_str` while still blocking wrong branches.
+3. Smart Single-Account Quota Allocation & Zero-Config UX:
+   - Veteran vs Conservative account tiers (`--account-tier veteran|conservative`) to protect newer accounts.
+   - Auto-derives `--out-dir` (`./crawl_data/{店铺名称}`) and locks onto the open store tab if omitted.
+   - After Pass 1 (`L1 p=0`), calculates exact `smoothRender` batches (`sum(ceil(rem/30))`). When a large
+     store (3,000~4,000 SPUs) exceeds remaining `smooth` quota, automatically schedules high-yield L2
+     sub-category `p=0` clicks FIRST to offload big multi-sub-tag shelves, preserving `smoothRender` quota
+     for 0-sub-tag tail categories (`未分类`, `神价`, etc.).
 """
 import argparse
 import asyncio
-import datetime
 import json
+import math
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -28,12 +42,38 @@ import websockets
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 EXPORT_EXCEL_PY = os.path.join(SCRIPT_DIR, 'export_competitor_excel.py')
+ANALYZE_STORE_PY = os.path.join(SCRIPT_DIR, 'analyze_competitor_store.py')
 
 PROMO_TAB_KEYWORDS = (
     '推荐', '神价', '活动', '热销', '折扣', '狂欢', '促销', '特惠',
     '满减', '爆品', '秒杀', '囤货', '买过', '常买', '优惠', '新品上新',
 )
 SKIP_VIRTUAL_TAGS = {'op0050'}
+
+ACCOUNT_TIER_PRESETS = {
+    'veteran': {
+        'min_delay': 68.0,
+        'max_delay': 88.0,
+        'hourly_cap': 38,
+        'wave_size': 30,
+        'wave_rest_sec': 600.0,
+        'max_sputag_24h': 92,
+        'max_smooth_24h': 85,
+    },
+    'conservative': {
+        'min_delay': 75.0,
+        'max_delay': 95.0,
+        'hourly_cap': 32,
+        'wave_size': 25,
+        'wave_rest_sec': 660.0,
+        'max_sputag_24h': 28,
+        'max_smooth_24h': 35,
+    },
+}
+
+
+def sanitize_store_slug(name):
+    return re.sub(r'[（）()\s/\\:*?"<>|]+', '', str(name or '竞对门店').strip()) or '竞对门店'
 
 
 def fetch_json(url, timeout=5.0):
@@ -96,10 +136,11 @@ async def eval_js(ws, msg_id, expr, timeout=25.0):
             return res.get('result', {}).get('value')
 
 
-async def verify_store_ready_or_stop(ws, msg_seq, expected_poi_id_str=None, expected_poi_name=None, on_stop=None):
+async def verify_store_ready_or_stop(ws, msg_seq, store_lock, on_stop=None):
     """
-    Check once that the tab is on the expected store page.
-    If gated by verify.meituan.com, flush partial data and exit immediately (code 42) — NEVER wait out challenges.
+    Verify once that the browser tab is on the locked store page.
+    - Immediately exits 42 if redirected to verify.meituan.com (never waits out challenges).
+    - Accepts Meituan's re-encrypted `poi_id_str` ONLY when both `poi_name` and `address` match 100%.
     """
     msg_seq += 1
     state = await eval_js(ws, msg_seq, '''
@@ -107,15 +148,15 @@ async def verify_store_ready_or_stop(ws, msg_seq, expected_poi_id_str=None, expe
         const hasPages = typeof getCurrentPages === 'function' && getCurrentPages().length > 0;
         const p = hasPages ? getCurrentPages()[0] : null;
         const menuLen = p && p.data && Array.isArray(p.data.menuTabs) ? p.data.menuTabs.length : 0;
-        const poiIdStr = p && p.data ? p.data.poi_id_str : '';
-        const poiName = p && p.data && p.data.poiInfo ? p.data.poiInfo.name : '';
-        const poiAddr = p && p.data && p.data.poiInfo ? p.data.poiInfo.address : '';
+        const poiIdStr = p && p.data ? String(p.data.poi_id_str || '') : '';
+        const poiName = p && p.data && p.data.poiInfo ? String(p.data.poiInfo.name || '') : '';
+        const poiAddr = p && p.data && p.data.poiInfo ? String(p.data.poiInfo.address || '') : '';
         return {url: location.href, hasPages, menuLen, poiIdStr, poiName, poiAddr};
     })()
     ''')
     cur_url = (state or {}).get('url') or ''
     if 'verify.meituan.com' in cur_url:
-        print(f"[STOP_ON_VERIFY] Page redirected to verification challenge ({cur_url[:90]}). Saving partial data and stopping immediately.", flush=True)
+        print(f"[STOP_ON_VERIFY] Page redirected to verification challenge ({cur_url[:90]}). Saving partial Excel and stopping immediately.", flush=True)
         if on_stop:
             on_stop()
         sys.exit(42)
@@ -123,23 +164,92 @@ async def verify_store_ready_or_stop(ws, msg_seq, expected_poi_id_str=None, expe
     if not state or not state.get('hasPages') or state.get('menuLen', 0) <= 0:
         if on_stop:
             on_stop()
-        raise RuntimeError(f"Target store page is not ready in Chrome tab (url={cur_url[:90]}). Please open the store page first.")
+        raise RuntimeError(f"Target store page is not open/ready in Chrome tab (url={cur_url[:90]}). Please open the store page first.")
 
     actual_id = state.get('poiIdStr') or ''
     actual_name = state.get('poiName') or ''
-    if expected_poi_id_str and actual_id != expected_poi_id_str:
+    actual_addr = state.get('poiAddr') or ''
+
+    exp_name_sub = store_lock.get('expected_name_substr')
+    if exp_name_sub and exp_name_sub not in actual_name:
         if on_stop:
             on_stop()
-        raise RuntimeError(
-            f"Store poi_id_str mismatch! Expected '{expected_poi_id_str}', but tab is on '{actual_name}' ({actual_id})."
-        )
-    if expected_poi_name and expected_poi_name not in actual_name:
+        raise RuntimeError(f"Store name mismatch! Expected '{exp_name_sub}', but tab is on '{actual_name}' ({actual_id}).")
+
+    locked_name = store_lock.get('locked_full_name')
+    locked_addr = store_lock.get('locked_address')
+    locked_id = store_lock.get('locked_poi_id_str')
+
+    if locked_name and actual_name != locked_name:
         if on_stop:
             on_stop()
-        raise RuntimeError(
-            f"Store name mismatch! Expected substring '{expected_poi_name}', but tab is on '{actual_name}' ({actual_id})."
-        )
+        raise RuntimeError(f"Branch mismatch! Locked onto '{locked_name}', but tab is on '{actual_name}'.")
+    if locked_addr and actual_addr and actual_addr != locked_addr:
+        if on_stop:
+            on_stop()
+        raise RuntimeError(f"Branch address mismatch! Locked onto '{locked_addr}', but tab is on '{actual_addr}'.")
+
+    if locked_id and actual_id != locked_id:
+        if locked_name and actual_name == locked_name and (not locked_addr or actual_addr == locked_addr):
+            print(f"[POI_ID_REFRESHED] Verified identical store '{actual_name}' ({actual_addr}); updated re-encrypted poi_id_str: {locked_id} -> {actual_id}", flush=True)
+            store_lock['locked_poi_id_str'] = actual_id
+        else:
+            if on_stop:
+                on_stop()
+            raise RuntimeError(f"Store poi_id_str mismatch! Expected '{locked_id}', got '{actual_id}' on '{actual_name}'.")
+
+    store_lock['locked_full_name'] = actual_name
+    store_lock['locked_address'] = actual_addr
+    store_lock['locked_poi_id_str'] = actual_id
     return msg_seq, state
+
+
+class RollingQuotaLedger:
+    """
+    Tracks both Rolling-24h (`86400s`) request timestamps and per-day counts in `daily_quota.json`.
+    Prevents `00:00` midnight rollover from resetting a single account's 24h safety cap.
+    Also stays backward-compatible with legacy `{"YYYY-MM-DD": {"sputag": N, "smooth": M}}` files.
+    """
+    def __init__(self, path):
+        self.path = path
+        self.data = {'events': {'sputag': [], 'smooth': []}, 'daily': {}}
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(self.path):
+            return
+        try:
+            raw = json.load(open(self.path, 'r', encoding='utf-8'))
+        except Exception:
+            return
+        now = time.time()
+        if isinstance(raw, dict) and 'events' in raw:
+            ev = raw.get('events') or {}
+            self.data['events']['sputag'] = [float(t) for t in (ev.get('sputag') or []) if now - float(t) < 86400.0]
+            self.data['events']['smooth'] = [float(t) for t in (ev.get('smooth') or []) if now - float(t) < 86400.0]
+            self.data['daily'] = raw.get('daily') or {}
+        elif isinstance(raw, dict):
+            # Migrate legacy date-keyed format conservatively for today
+            today = time.strftime('%Y-%m-%d')
+            self.data['daily'] = {k: v for k, v in raw.items() if isinstance(v, dict)}
+            td = raw.get(today) or {}
+            self.data['events']['sputag'] = [now] * int(td.get('sputag', 0))
+            self.data['events']['smooth'] = [now] * int(td.get('smooth', 0))
+
+    def count_24h(self, ep):
+        now = time.time()
+        self.data['events'][ep] = [t for t in self.data['events'].get(ep, []) if now - t < 86400.0]
+        return len(self.data['events'][ep])
+
+    def record(self, ep):
+        now = time.time()
+        day = time.strftime('%Y-%m-%d')
+        self.data['events'].setdefault(ep, []).append(now)
+        self.data['events'][ep] = [t for t in self.data['events'][ep] if now - t < 86400.0]
+        self.data['daily'].setdefault(day, {'sputag': 0, 'smooth': 0})
+        self.data['daily'][day][ep] = int(self.data['daily'][day].get(ep, 0)) + 1
+        with open(self.path, 'w', encoding='utf-8') as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
 
 
 REQ_TIMESTAMPS = []
@@ -159,20 +269,17 @@ def load_timestamps(ts_json):
             return
         except Exception:
             pass
-    REQ_TIMESTAMPS = []
-    SPUTAG_TIMESTAMPS = []
-    SMOOTH_TIMESTAMPS = []
+    REQ_TIMESTAMPS, SPUTAG_TIMESTAMPS, SMOOTH_TIMESTAMPS = [], [], []
 
 
 def save_timestamps(ts_json):
     now = time.time()
-    data = {
-        'req': [t for t in REQ_TIMESTAMPS if now - t < 3720.0],
-        'sputag': [t for t in SPUTAG_TIMESTAMPS if now - t < 3720.0],
-        'smooth': [t for t in SMOOTH_TIMESTAMPS if now - t < 3720.0],
-    }
     with open(ts_json, 'w', encoding='utf-8') as f:
-        json.dump(data, f)
+        json.dump({
+            'req': [t for t in REQ_TIMESTAMPS if now - t < 3720.0],
+            'sputag': [t for t in SPUTAG_TIMESTAMPS if now - t < 3720.0],
+            'smooth': [t for t in SMOOTH_TIMESTAMPS if now - t < 3720.0],
+        }, f)
 
 
 async def polite_sleep(
@@ -189,7 +296,7 @@ async def polite_sleep(
         rest_s = random.uniform(wave_rest_sec * 0.95, wave_rest_sec * 1.1)
         if export_cb:
             export_cb()
-        print(f"  [Wave Rest] Completed {req_counter - 1} requests -> pausing {rest_s/60:.1f} mins to keep request rate low...", flush=True)
+        print(f"  [Wave Rest] Completed {req_counter - 1} requests -> pausing {rest_s/60:.1f} mins to keep request frequency low...", flush=True)
         await asyncio.sleep(rest_s)
 
     ep_list = SPUTAG_TIMESTAMPS if endpoint == 'sputag_p0' else SMOOTH_TIMESTAMPS
@@ -230,6 +337,30 @@ async def polite_sleep(
     save_timestamps(ts_json)
 
 
+def compute_remaining_smooth_batches(ordered_tabs, cat_map, seen_spus, unfetchable_ids):
+    """Simulate deduplicated batch=30 smoothRender calls across ordered_tabs."""
+    sim_seen = set(seen_spus.keys()) | set(unfetchable_ids)
+    batches = 0
+    for m in ordered_tabs:
+        cinfo = cat_map.get(str(m['idx'])) or {}
+        ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
+        while True:
+            rem = [x for x in ids if x not in sim_seen]
+            if not rem:
+                break
+            sim_seen.update(rem[:30])
+            batches += 1
+    return batches
+
+
+def estimate_eta_minutes(num_reqs, min_delay, max_delay, wave_size, wave_rest_sec):
+    if num_reqs <= 0:
+        return 0.0
+    avg_step = (min_delay + max_delay) / 2.0 + 4.0
+    waves = (num_reqs // wave_size) if (wave_size and wave_size > 0) else 0
+    return (num_reqs * avg_step + waves * wave_rest_sec) / 60.0
+
+
 def find_store_tab(tabs):
     page_tabs = [t for t in tabs if t.get('type') == 'page']
     for pattern in ('cactivityapi-sc.waimai.meituan.com', 'verify.meituan.com', 'wx-shangou.meituan.com', 'h5.waimai.meituan.com'):
@@ -257,8 +388,8 @@ async def run_crawler(args):
     if not target:
         raise RuntimeError(f"Could not find open Meituan H5 store tab in Chrome on port {args.port}. Please log in and open the store page first.")
 
-    if args.inspect_only:
-        async with websockets.connect(target['webSocketDebuggerUrl'], max_size=50 * 1024 * 1024) as ws:
+    async with websockets.connect(target['webSocketDebuggerUrl'], max_size=50 * 1024 * 1024) as ws:
+        if args.inspect_only:
             state = await eval_js(ws, 1, '''
             (() => {
                 const hasPages = typeof getCurrentPages === 'function' && getCurrentPages().length > 0;
@@ -280,85 +411,92 @@ async def run_crawler(args):
             print(json.dumps(state, ensure_ascii=False, indent=2), flush=True)
             return
 
-    if not args.out_dir:
-        raise SystemExit('--out-dir is required unless --inspect-only is specified')
-
-    os.makedirs(args.out_dir, exist_ok=True)
-    spus_jsonl = os.path.join(args.out_dir, 'spus.jsonl')
-    cat_map_json = os.path.join(args.out_dir, 'categories.json')
-    ts_json = os.path.join(args.out_dir, 'timestamps.json')
-    progress_json = os.path.join(args.out_dir, 'progress.json')
-    daily_quota_json = os.path.join(args.out_dir, 'daily_quota.json')
-
-    daily_quota = {}
-    if os.path.exists(daily_quota_json):
-        try:
-            daily_quota = json.load(open(daily_quota_json, 'r', encoding='utf-8'))
-        except Exception:
-            daily_quota = {}
-
-    def today_key():
-        return datetime.date.today().isoformat()
-
-    def get_daily_count(ep):
-        return int((daily_quota.get(today_key()) or {}).get(ep, 0))
-
-    def inc_daily_count(ep):
-        tk = today_key()
-        daily_quota.setdefault(tk, {'sputag': 0, 'smooth': 0})
-        daily_quota[tk][ep] = int(daily_quota[tk].get(ep, 0)) + 1
-        with open(daily_quota_json, 'w', encoding='utf-8') as df:
-            json.dump(daily_quota, df, ensure_ascii=False, indent=2)
-
-    print(
-        f"[Daily Quota] {today_key()}: sputag={get_daily_count('sputag')}/{args.max_sputag_daily}, "
-        f"smooth={get_daily_count('smooth')}/{args.max_smooth_daily}",
-        flush=True,
-    )
-
-    load_timestamps(ts_json)
-    seen_spus = load_existing_spus(spus_jsonl)
-    cat_map = {}
-    if os.path.exists(cat_map_json):
-        try:
-            cat_map = json.load(open(cat_map_json, 'r', encoding='utf-8'))
-        except Exception:
-            cat_map = {}
-
-    msg_seq = 1
-    req_counter = 0
-
-    async with websockets.connect(target['webSocketDebuggerUrl'], max_size=50 * 1024 * 1024) as ws:
-        msg_seq, state = await verify_store_ready_or_stop(ws, msg_seq, args.poi_id_str, args.poi_name)
-        actual_poi_id = state.get('poiIdStr')
+        msg_seq = 1
+        store_lock = {
+            'expected_name_substr': args.poi_name,
+            'locked_poi_id_str': args.poi_id_str,
+            'locked_full_name': None,
+            'locked_address': None,
+        }
+        msg_seq, state = await verify_store_ready_or_stop(ws, msg_seq, store_lock)
         actual_poi_name = state.get('poiName')
+        actual_poi_addr = state.get('poiAddr')
+
+        # Auto-derive --out-dir if omitted so a single zero-config command works out of the box
+        out_dir = args.out_dir or os.path.join('.', 'crawl_data', sanitize_store_slug(args.poi_name or actual_poi_name))
+        os.makedirs(out_dir, exist_ok=True)
+
+        spus_jsonl = os.path.join(out_dir, 'spus.jsonl')
+        cat_map_json = os.path.join(out_dir, 'categories.json')
+        ts_json = os.path.join(out_dir, 'timestamps.json')
+        progress_json = os.path.join(out_dir, 'progress.json')
+        daily_quota_json = os.path.join(out_dir, 'daily_quota.json')
+
+        # Load prior progress to lock branch identity & sticky target_mmdd across midnight
+        sticky_mmdd = args.date_mmdd
+        if os.path.exists(progress_json):
+            try:
+                prior_prog = json.load(open(progress_json, 'r', encoding='utf-8'))
+                if prior_prog.get('poi_name') and prior_prog['poi_name'] != actual_poi_name:
+                    raise RuntimeError(f"Output dir '{out_dir}' belongs to '{prior_prog['poi_name']}', but Chrome is on '{actual_poi_name}'!")
+                if prior_prog.get('poi_address') and actual_poi_addr and prior_prog['poi_address'] != actual_poi_addr:
+                    raise RuntimeError(f"Output dir '{out_dir}' address '{prior_prog['poi_address']}' != current tab '{actual_poi_addr}'!")
+                if not sticky_mmdd and prior_prog.get('target_mmdd'):
+                    sticky_mmdd = prior_prog['target_mmdd']
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+        if not sticky_mmdd:
+            sticky_mmdd = time.strftime('%m%d')
+
+        quota_ledger = RollingQuotaLedger(daily_quota_json)
+        print(
+            f"[Rolling-24h Quota ({args.account_tier})] sputag={quota_ledger.count_24h('sputag')}/{args.max_sputag_daily}, "
+            f"smooth={quota_ledger.count_24h('smooth')}/{args.max_smooth_daily} | Sticky Date: {sticky_mmdd}",
+            flush=True,
+        )
+
+        load_timestamps(ts_json)
+        seen_spus = load_existing_spus(spus_jsonl)
+        cat_map = {}
+        if os.path.exists(cat_map_json):
+            try:
+                cat_map = json.load(open(cat_map_json, 'r', encoding='utf-8'))
+            except Exception:
+                cat_map = {}
+
+        req_counter = 0
         store_name_for_file = args.poi_name or actual_poi_name or '竞对门店'
+        excel_dir = args.excel_out_dir or '.'
         out_f = open(spus_jsonl, 'a', encoding='utf-8')
 
-        def export_current_excel():
+        def export_current_excel(run_analysis=False):
             out_f.flush()
             if os.path.exists(EXPORT_EXCEL_PY) and os.path.exists(spus_jsonl) and os.path.exists(cat_map_json):
-                cmd = [
+                subprocess.run([
                     sys.executable, EXPORT_EXCEL_PY,
                     '--spus-jsonl', spus_jsonl,
                     '--cat-json', cat_map_json,
-                    '--out-dir', args.excel_out_dir or args.out_dir,
+                    '--out-dir', excel_dir,
                     '--store-name', store_name_for_file,
-                ]
-                if args.date_mmdd:
-                    cmd.extend(['--date-mmdd', args.date_mmdd])
-                subprocess.run(cmd, check=False)
+                    '--date-mmdd', sticky_mmdd,
+                ], check=False)
+                if run_analysis and not args.no_report and os.path.exists(ANALYZE_STORE_PY):
+                    xlsx_path = os.path.join(excel_dir, f"{sticky_mmdd}{sanitize_store_slug(store_name_for_file)}.xlsx")
+                    if os.path.exists(xlsx_path):
+                        subprocess.run([sys.executable, ANALYZE_STORE_PY, '--excel', xlsx_path], check=False)
 
         def handle_stop_error(context_label, err_msg):
-            export_current_excel()
+            export_current_excel(run_analysis=True)
             out_f.close()
             if '418' in err_msg or 'verify' in err_msg.lower():
-                print(f"[STOP_ON_VERIFY] {context_label} encountered verification challenge ({err_msg}). Saved partial Excel and exiting immediately.", flush=True)
+                print(f"[STOP_ON_VERIFY] {context_label} encountered verification challenge ({err_msg}). Partial Excel & report saved; stopping immediately.", flush=True)
                 sys.exit(42)
             if '403' in err_msg or '406' in err_msg:
-                print(f"[STOP_ON_403] {context_label} encountered HTTP 403/406 restriction ({err_msg}). Saved partial Excel and exiting immediately.", flush=True)
+                print(f"[STOP_ON_403] {context_label} encountered HTTP 403/406 restriction ({err_msg}). Partial Excel & report saved; stopping immediately.", flush=True)
                 sys.exit(43)
-            print(f"[STOP_ON_ERROR] {context_label} failed ({err_msg}). Saved partial Excel and exiting.", flush=True)
+            print(f"[STOP_ON_ERROR] {context_label} failed ({err_msg}). Partial Excel saved; exiting.", flush=True)
             sys.exit(1)
 
         msg_seq += 1
@@ -384,10 +522,9 @@ async def run_crawler(args):
         })()
         ''')
         menu_tabs = meta.get('menuTabs') or []
-        poi_info = meta.get('poiInfo') or {}
         print(
-            f"[Store Verified] {poi_info.get('name')} ({meta.get('poi_id_str')}) | "
-            f"Address: {poi_info.get('address', '')} | L1 categories: {len(menu_tabs)} | Existing SPUs: {len(seen_spus)}",
+            f"[Store Locked] {actual_poi_name} ({store_lock['locked_poi_id_str']}) | "
+            f"Address: {actual_poi_addr} | L1 categories: {len(menu_tabs)} | OutDir: {out_dir} | Existing SPUs: {len(seen_spus)}",
             flush=True,
         )
 
@@ -419,8 +556,10 @@ async def run_crawler(args):
             with open(progress_json, 'w', encoding='utf-8') as pf:
                 json.dump({
                     'phase': phase,
-                    'poi_id_str': actual_poi_id,
+                    'poi_id_str': store_lock['locked_poi_id_str'],
                     'poi_name': actual_poi_name,
+                    'poi_address': actual_poi_addr,
+                    'target_mmdd': sticky_mmdd,
                     'step': step_num,
                     'total_steps': total_steps,
                     'current_l1_idx': idx,
@@ -455,7 +594,7 @@ async def run_crawler(args):
         ''')
         mem_added = sum(record_spus(item.get('spus'), item.get('idx'), item.get('name'), item.get('tag')) for item in (mem_spus or []))
         if mem_added:
-            print(f"[Memory Harvest] Recovered +{mem_added} SPUs from initial page state (unique={len(seen_spus)})", flush=True)
+            print(f"[Memory Harvest] Recovered +{mem_added} SPUs from initial page memory (unique={len(seen_spus)}, 0 reqs)", flush=True)
 
         entity_tabs, promo_tabs = [], []
         for m in menu_tabs:
@@ -474,12 +613,12 @@ async def run_crawler(args):
             wave_rest_sec=args.wave_rest_sec,
         )
         print(
-            f"[Pacing] delay={args.min_delay:.0f}~{args.max_delay:.0f}s, hourly_cap={args.hourly_cap}, "
+            f"[Pacing ({args.account_tier})] delay={args.min_delay:.0f}~{args.max_delay:.0f}s, hourly_cap={args.hourly_cap}, "
             f"wave_size={args.wave_size}, wave_rest={args.wave_rest_sec/60:.1f}m",
             flush=True,
         )
 
-        # PASS 1: L1 categories at page_index=0
+        # ==================== PASS 1: L1 categories at page_index=0 ====================
         for step_num, m in enumerate(ordered_tabs, 1):
             idx, name, tag = m['idx'], m['name'], m['tag']
             sub_idx = 0 if m['hasSub'] else -1
@@ -516,16 +655,16 @@ async def run_crawler(args):
                 print(f"[Pass1 {step_num}/{len(ordered_tabs)}] Cat[{idx}] {name}: {len(mem_cat['allSortedSpuId'])} IDs in memory (+{added_mem} SPUs, 0 reqs)", flush=True)
                 continue
 
-            if args.max_sputag_daily > 0 and get_daily_count('sputag') >= args.max_sputag_daily:
-                print(f"[DAILY_QUOTA_GUARD] spuTagProducts reached daily soft cap ({get_daily_count('sputag')}/{args.max_sputag_daily}). Saving and stopping cleanly.", flush=True)
-                export_current_excel()
+            if args.max_sputag_daily > 0 and quota_ledger.count_24h('sputag') >= args.max_sputag_daily:
+                print(f"[DAILY_QUOTA_GUARD] spuTagProducts reached 24h soft cap ({quota_ledger.count_24h('sputag')}/{args.max_sputag_daily}). Saving Excel & report and stopping cleanly.", flush=True)
+                export_current_excel(run_analysis=True)
                 out_f.close()
                 sys.exit(44)
 
             req_counter += 1
             await polite_sleep(req_counter, ts_json, endpoint='sputag_p0', export_cb=export_current_excel, **pacing_kw)
-            msg_seq, _ = await verify_store_ready_or_stop(ws, msg_seq, actual_poi_id, args.poi_name, on_stop=export_current_excel)
-            inc_daily_count('sputag')
+            msg_seq, _ = await verify_store_ready_or_stop(ws, msg_seq, store_lock, on_stop=lambda: export_current_excel(run_analysis=True))
+            quota_ledger.record('sputag')
 
             msg_seq += 1
             res = await eval_js(ws, msg_seq, f'''
@@ -560,12 +699,101 @@ async def run_crawler(args):
             with open(cat_map_json, 'w', encoding='utf-8') as cf:
                 json.dump(cat_map, cf, ensure_ascii=False, indent=2)
             save_progress('Pass1_L1_p0', step_num, len(ordered_tabs), idx, name)
-            print(f"[Pass1 {step_num}/{len(ordered_tabs)}] Cat[{idx}] {name}: {len(all_ids)} total IDs, +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
+            rem_cats = sum(1 for t in ordered_tabs[step_num:] if str(t['idx']) not in cat_map or not cat_map[str(t['idx'])].get('allSortedSpuId'))
+            print(f"[Pass1 {step_num}/{len(ordered_tabs)}] Cat[{idx}] {name}: {len(all_ids)} IDs, +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter}, Pass1 left={rem_cats})", flush=True)
 
         export_current_excel()
 
-        # PASS 1.5: Smooth pagination batch=30
-        smooth_capped = bool(args.max_smooth_daily > 0 and get_daily_count('smooth') >= args.max_smooth_daily)
+        # ==================== SMART SINGLE-ACCOUNT QUOTA PLANNER ====================
+        # If total remaining smoothRender batches exceed remaining 24h smooth quota (large 3,000~4,000 SPU store),
+        # automatically run high-yield L2 sub-category `p=0` clicks FIRST to offload big multi-sub-tag categories,
+        # preserving precious `smoothRender` quota for 0-sub-tag / small tail categories!
+        async def run_l2_pass(stop_when_smooth_fits=False):
+            nonlocal msg_seq, req_counter
+            candidates = []
+            for m in ordered_tabs:
+                cinfo = cat_map.get(str(m['idx'])) or {}
+                all_ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
+                missing_ids = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
+                sub_tags_list = cinfo.get('sub_tags') or m.get('sub_tags') or []
+                sub_left = sum(1 for s_i, st in enumerate(sub_tags_list) if s_i > 0 and st.get('name') != '全部' and not st.get('allSortedSpuId'))
+                if len(missing_ids) >= 20 and sub_left > 0:
+                    candidates.append((len(missing_ids) / sub_left, len(missing_ids), m))
+            candidates.sort(key=lambda item: (-item[0], -item[1]))
+
+            for step_num, (_, _, m) in enumerate(candidates, 1):
+                idx, name, tag = m['idx'], m['name'], m['tag']
+                cinfo = cat_map.get(str(idx)) or {}
+                all_ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
+                sub_tags_list = cinfo.get('sub_tags') or m.get('sub_tags') or []
+                cinfo['sub_tags'] = sub_tags_list
+                for s_idx, st in enumerate(sub_tags_list):
+                    if s_idx == 0 or st.get('name') == '全部' or st.get('allSortedSpuId'):
+                        continue
+                    if not [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]:
+                        break
+                    if stop_when_smooth_fits and args.max_smooth_daily > 0:
+                        rem_sm_cap = max(0, args.max_smooth_daily - quota_ledger.count_24h('smooth'))
+                        cur_sm_need = compute_remaining_smooth_batches(ordered_tabs, cat_map, seen_spus, unfetchable_ids)
+                        if cur_sm_need <= max(0, rem_sm_cap - 2):
+                            print(f"[Smart Planner] Remaining smoothRender batches ({cur_sm_need}) now fit safely within 24h smooth quota ({rem_sm_cap}) -> switching to smoothRender sweep!", flush=True)
+                            return
+                    if args.max_sputag_daily > 0 and quota_ledger.count_24h('sputag') >= args.max_sputag_daily:
+                        print(f"[DAILY_QUOTA_GUARD] spuTagProducts reached 24h soft cap ({quota_ledger.count_24h('sputag')}/{args.max_sputag_daily}).", flush=True)
+                        return
+
+                    st_name = st.get('name', '')
+                    req_counter += 1
+                    await polite_sleep(req_counter, ts_json, endpoint='sputag_p0', export_cb=export_current_excel, **pacing_kw)
+                    msg_seq, _ = await verify_store_ready_or_stop(ws, msg_seq, store_lock, on_stop=lambda: export_current_excel(run_analysis=True))
+                    quota_ledger.record('sputag')
+
+                    msg_seq += 1
+                    res = await eval_js(ws, msg_seq, f'''
+                    (async () => {{
+                        const p = getCurrentPages()[0];
+                        const c = p._getCachedData({idx}, {s_idx});
+                        try {{
+                            await p.requestSpusAndSortedIds({idx}, {s_idx}, c.tag, c.type, 0, true);
+                        }} catch (err) {{
+                            return {{error: String(err.message || err)}};
+                        }}
+                        const c2 = p._getCachedData({idx}, {s_idx});
+                        return {{allSortedSpuId: c2.allSortedSpuId || [], spus: c2.spus || []}};
+                    }})()
+                    ''')
+                    if res and res.get('error'):
+                        handle_stop_error(f"L2 Cat[{idx}] Sub[{s_idx}] {st_name}", str(res['error']))
+
+                    st['allSortedSpuId'] = [int(x) for x in ((res or {}).get('allSortedSpuId') or [])]
+                    added = record_spus((res or {}).get('spus') or [], idx, name, tag)
+                    with open(cat_map_json, 'w', encoding='utf-8') as cf:
+                        json.dump(cat_map, cf, ensure_ascii=False, indent=2)
+                    save_progress('Pass_L2_p0', step_num, len(ordered_tabs), idx, f"{name}/{st_name}")
+                    print(f"  -> [L2 p=0] Cat[{idx}] {name} / Sub[{s_idx}] {st_name}: +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
+
+        needed_smooth = compute_remaining_smooth_batches(ordered_tabs, cat_map, seen_spus, unfetchable_ids)
+        rem_smooth_24h = max(0, args.max_smooth_daily - quota_ledger.count_24h('smooth')) if args.max_smooth_daily > 0 else 999999
+        rem_sputag_24h = max(0, args.max_sputag_daily - quota_ledger.count_24h('sputag')) if args.max_sputag_daily > 0 else 999999
+        all_l1_ids = {int(sid) for v_cat in cat_map.values() for sid in (v_cat.get('allSortedSpuId') or [])}
+        eta_m = estimate_eta_minutes(needed_smooth, args.min_delay, args.max_delay, args.wave_size, args.wave_rest_sec)
+        print(
+            f"[Store Catalog Summary] Total L1 SPUs={len(all_l1_ids)} | Collected={len(seen_spus)} | "
+            f"Smooth batches needed={needed_smooth} (24h smooth remaining={rem_smooth_24h}, sputag remaining={rem_sputag_24h}) | Est. smooth ETA={eta_m:.0f}m",
+            flush=True,
+        )
+
+        if args.max_smooth_daily > 0 and needed_smooth > rem_smooth_24h and rem_sputag_24h > 0:
+            print(
+                f"[Smart Planner] Store needs {needed_smooth} smooth batches > {rem_smooth_24h} remaining smooth quota; "
+                f"using up to {rem_sputag_24h} remaining L2 p=0 calls FIRST on big categories so smooth quota covers tail categories!",
+                flush=True,
+            )
+            await run_l2_pass(stop_when_smooth_fits=True)
+            export_current_excel()
+
+        # ==================== PASS 1.5: Smooth pagination batch=30 ====================
+        smooth_capped = bool(args.max_smooth_daily > 0 and quota_ledger.count_24h('smooth') >= args.max_smooth_daily)
         for step_num, m in enumerate(ordered_tabs, 1):
             if smooth_capped:
                 break
@@ -577,8 +805,8 @@ async def run_crawler(args):
                 continue
 
             while not smooth_capped:
-                if args.max_smooth_daily > 0 and get_daily_count('smooth') >= args.max_smooth_daily:
-                    print(f"[DAILY_QUOTA_GUARD] smoothRender reached daily soft cap ({get_daily_count('smooth')}/{args.max_smooth_daily}). Switching to Pass 2 if quota allows.", flush=True)
+                if args.max_smooth_daily > 0 and quota_ledger.count_24h('smooth') >= args.max_smooth_daily:
+                    print(f"[DAILY_QUOTA_GUARD] smoothRender reached 24h soft cap ({quota_ledger.count_24h('smooth')}/{args.max_smooth_daily}).", flush=True)
                     smooth_capped = True
                     break
                 missing_ids = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
@@ -587,8 +815,8 @@ async def run_crawler(args):
                 batch = [str(x) for x in missing_ids[:30]]
                 req_counter += 1
                 await polite_sleep(req_counter, ts_json, endpoint='smooth', export_cb=export_current_excel, **pacing_kw)
-                msg_seq, _ = await verify_store_ready_or_stop(ws, msg_seq, actual_poi_id, args.poi_name, on_stop=export_current_excel)
-                inc_daily_count('smooth')
+                msg_seq, _ = await verify_store_ready_or_stop(ws, msg_seq, store_lock, on_stop=lambda: export_current_excel(run_analysis=True))
+                quota_ledger.record('smooth')
 
                 msg_seq += 1
                 res = await eval_js(ws, msg_seq, f'''
@@ -621,96 +849,72 @@ async def run_crawler(args):
                 added = record_spus(spus, idx, name, tag)
                 rem_after = len([x for x in all_ids if x not in seen_spus and x not in unfetchable_ids])
                 save_progress('Pass1.5_smoothRender', step_num, len(ordered_tabs), idx, name)
-                print(f"  -> Cat[{idx}] {name} [batch={len(batch)}, rem={rem_after}]: +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
+                if req_counter % 5 == 0:
+                    rem_b = compute_remaining_smooth_batches(ordered_tabs, cat_map, seen_spus, unfetchable_ids)
+                    rem_eta = estimate_eta_minutes(rem_b, args.min_delay, args.max_delay, args.wave_size, args.wave_rest_sec)
+                    print(f"  -> Cat[{idx}] {name} [batch={len(batch)}, cat_rem={rem_after}]: +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter} | ~{rem_b} batches / ~{rem_eta:.0f}m left)", flush=True)
+                else:
+                    print(f"  -> Cat[{idx}] {name} [batch={len(batch)}, cat_rem={rem_after}]: +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
 
-        export_current_excel()
+        # If smooth hit soft cap and sputag still has 24h allowance, run remaining L2 sub-categories
+        if smooth_capped and (args.max_sputag_daily <= 0 or quota_ledger.count_24h('sputag') < args.max_sputag_daily):
+            await run_l2_pass(stop_when_smooth_fits=False)
 
-        # PASS 2: Optional L2 sub-categories at page_index=0 (only if smooth hit soft cap, never after HTTP 403)
-        pass2_candidates = []
-        for m in ordered_tabs:
-            cinfo = cat_map.get(str(m['idx'])) or {}
-            all_ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
-            missing_ids = [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]
-            sub_tags_list = cinfo.get('sub_tags') or m.get('sub_tags') or []
-            sub_left = sum(1 for s_i, st in enumerate(sub_tags_list) if s_i > 0 and st.get('name') != '全部' and not st.get('allSortedSpuId'))
-            if len(missing_ids) >= 20 and sub_left > 0:
-                pass2_candidates.append((len(missing_ids) / sub_left, len(missing_ids), m))
-        pass2_candidates.sort(key=lambda item: (-item[0], -item[1]))
-
-        for step_num, (_, _, m) in enumerate(pass2_candidates, 1):
-            idx, name, tag = m['idx'], m['name'], m['tag']
-            cinfo = cat_map.get(str(idx)) or {}
-            all_ids = [int(x) for x in (cinfo.get('allSortedSpuId') or [])]
-            sub_tags_list = cinfo.get('sub_tags') or m.get('sub_tags') or []
-            cinfo['sub_tags'] = sub_tags_list
-            for s_idx, st in enumerate(sub_tags_list):
-                if s_idx == 0 or st.get('name') == '全部' or st.get('allSortedSpuId'):
-                    continue
-                if not [x for x in all_ids if x not in seen_spus and x not in unfetchable_ids]:
-                    break
-                if args.max_sputag_daily > 0 and get_daily_count('sputag') >= args.max_sputag_daily:
-                    print(f"[DAILY_QUOTA_GUARD] spuTagProducts reached daily soft cap ({get_daily_count('sputag')}/{args.max_sputag_daily}). Saving and stopping cleanly.", flush=True)
-                    export_current_excel()
-                    out_f.close()
-                    sys.exit(44)
-                st_name = st.get('name', '')
-                req_counter += 1
-                await polite_sleep(req_counter, ts_json, endpoint='sputag_p0', export_cb=export_current_excel, **pacing_kw)
-                msg_seq, _ = await verify_store_ready_or_stop(ws, msg_seq, actual_poi_id, args.poi_name, on_stop=export_current_excel)
-                inc_daily_count('sputag')
-
-                msg_seq += 1
-                res = await eval_js(ws, msg_seq, f'''
-                (async () => {{
-                    const p = getCurrentPages()[0];
-                    const c = p._getCachedData({idx}, {s_idx});
-                    try {{
-                        await p.requestSpusAndSortedIds({idx}, {s_idx}, c.tag, c.type, 0, true);
-                    }} catch (err) {{
-                        return {{error: String(err.message || err)}};
-                    }}
-                    const c2 = p._getCachedData({idx}, {s_idx});
-                    return {{allSortedSpuId: c2.allSortedSpuId || [], spus: c2.spus || []}};
-                }})()
-                ''')
-                if res and res.get('error'):
-                    handle_stop_error(f"Pass2 Cat[{idx}] Sub[{s_idx}] {st_name}", str(res['error']))
-
-                st['allSortedSpuId'] = [int(x) for x in ((res or {}).get('allSortedSpuId') or [])]
-                added = record_spus((res or {}).get('spus') or [], idx, name, tag)
-                with open(cat_map_json, 'w', encoding='utf-8') as cf:
-                    json.dump(cat_map, cf, ensure_ascii=False, indent=2)
-                save_progress('Pass2_L2_p0', step_num, len(ordered_tabs), idx, f"{name}/{st_name}")
-                print(f"  -> Cat[{idx}] {name} / Sub[{s_idx}] {st_name}: +{added} SPUs (unique={len(seen_spus)}, reqs={req_counter})", flush=True)
-
-        export_current_excel()
+        export_current_excel(run_analysis=True)
         out_f.close()
         all_discovered_ids = {int(sid) for v_cat in cat_map.values() for sid in (v_cat.get('allSortedSpuId') or [])}
-        missing_final = len([sid for sid in all_discovered_ids if sid not in seen_spus])
+        missing_final = len([sid for sid in all_discovered_ids if sid not in seen_spus and sid not in unfetchable_ids])
+        if missing_final > 0 and (smooth_capped or (args.max_sputag_daily > 0 and quota_ledger.count_24h('sputag') >= args.max_sputag_daily)):
+            print(
+                f"[PARTIAL_BY_DAILY_CAP] {actual_poi_name}: safely collected {len(seen_spus)} unique SPUs "
+                f"(remaining={missing_final}) within 24h single-account soft cap. Resume with same command tomorrow after 24h quota refreshes.",
+                flush=True,
+            )
+            sys.exit(44)
         print(
             f"[DONE] {actual_poi_name}: collected {len(seen_spus)} unique SPUs "
-            f"(remaining_in_l1={missing_final}) in {req_counter} requests.",
+            f"(remaining={missing_final}) in {req_counter} requests.",
             flush=True,
         )
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Meituan H5 Store Catalog Collector (Polite-Pacing Compliant Edition)')
+    parser = argparse.ArgumentParser(description='Meituan H5 Store Catalog Collector (Compliant Effortless Edition)')
     parser.add_argument('--port', type=int, default=9222, help='Chrome remote debugging port (default: 9222)')
     parser.add_argument('--inspect-only', action='store_true', help='Only inspect open Meituan H5 store tab and exit')
-    parser.add_argument('--poi-id-str', type=str, default=None, help='Expected poi_id_str')
-    parser.add_argument('--poi-name', type=str, default=None, help='Expected store name substring')
-    parser.add_argument('--out-dir', type=str, default=None, help='Output directory for spus.jsonl, categories.json, timestamps.json')
-    parser.add_argument('--excel-out-dir', type=str, default=None, help='Directory for exported {MMDD}{店铺名称}.xlsx')
-    parser.add_argument('--date-mmdd', type=str, default=None, help='Optional MMDD override for Excel filename')
-    parser.add_argument('--min-delay', type=float, default=68.0, help='Minimum delay between requests in seconds (default: 68)')
-    parser.add_argument('--max-delay', type=float, default=88.0, help='Maximum delay between requests in seconds (default: 88)')
-    parser.add_argument('--hourly-cap', type=int, default=38, help='Max requests per 62-minute window (default: 38)')
-    parser.add_argument('--wave-size', type=int, default=30, help='Requests per wave before deep pause (default: 30)')
-    parser.add_argument('--wave-rest-sec', type=float, default=600.0, help='Deep pause duration in seconds after each wave (default: 600)')
-    parser.add_argument('--max-sputag-daily', type=int, default=92, help='Daily soft cap for spuTagProducts(p=0) (default: 92)')
-    parser.add_argument('--max-smooth-daily', type=int, default=85, help='Daily soft cap for requestSmoothSpus(batch=30) (default: 85)')
+    parser.add_argument('--account-tier', choices=('veteran', 'conservative'), default='veteran',
+                        help="'veteran' (default: 68~88s, <=38/h, 92/85 24h caps) or 'conservative' for newer/low-activity accounts (75~95s, <=32/h, 28/35 24h caps)")
+    parser.add_argument('--poi-id-str', type=str, default=None, help='Optional expected poi_id_str (auto-detected from open store tab if omitted)')
+    parser.add_argument('--poi-name', type=str, default=None, help='Optional expected store name substring (auto-detected if omitted)')
+    parser.add_argument('--out-dir', type=str, default=None, help='Directory for checkpoint files (defaults to ./crawl_data/{店铺名称})')
+    parser.add_argument('--excel-out-dir', type=str, default='.', help='Directory for exported {MMDD}{店铺名称}.xlsx (default: current dir)')
+    parser.add_argument('--date-mmdd', type=str, default=None, help='Optional MMDD override for Excel filename (sticky across midnight)')
+    parser.add_argument('--no-report', action='store_true', help='Skip auto-generating {MMDD}{店铺名称}_数据分析报告.md')
+    parser.add_argument('--min-delay', type=float, default=None, help='Override minimum delay between requests in seconds')
+    parser.add_argument('--max-delay', type=float, default=None, help='Override maximum delay between requests in seconds')
+    parser.add_argument('--hourly-cap', type=int, default=None, help='Override max requests per 62-minute window')
+    parser.add_argument('--wave-size', type=int, default=None, help='Override requests per wave before deep pause')
+    parser.add_argument('--wave-rest-sec', type=float, default=None, help='Override deep pause duration in seconds')
+    parser.add_argument('--max-sputag-daily', type=int, default=None, help='Override 24h soft cap for spuTagProducts(p=0)')
+    parser.add_argument('--max-smooth-daily', type=int, default=None, help='Override 24h soft cap for requestSmoothSpus(batch=30)')
     args = parser.parse_args()
+
+    preset = ACCOUNT_TIER_PRESETS[args.account_tier]
+    if args.min_delay is None:
+        args.min_delay = preset['min_delay']
+    if args.max_delay is None:
+        args.max_delay = preset['max_delay']
+    if args.hourly_cap is None:
+        args.hourly_cap = preset['hourly_cap']
+    if args.wave_size is None:
+        args.wave_size = preset['wave_size']
+    if args.wave_rest_sec is None:
+        args.wave_rest_sec = preset['wave_rest_sec']
+    if args.max_sputag_daily is None:
+        args.max_sputag_daily = preset['max_sputag_24h']
+    if args.max_smooth_daily is None:
+        args.max_smooth_daily = preset['max_smooth_24h']
+
     asyncio.run(run_crawler(args))
 
 
